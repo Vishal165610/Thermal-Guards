@@ -26,10 +26,10 @@ export default function App() {
         <div className="text-3xl font-extrabold tracking-tight text-ink">Thermal Guard</div>
         <div className="flex items-center gap-2 text-lg text-muted">
           <WifiOff className="h-5 w-5 text-crit" />
-          {connected ? 'Waiting for the first simulation step…' : 'Connecting to the simulation server on port 4000…'}
+          {connected ? 'Waiting for the first simulation step…' : 'Starting browser simulation…'}
         </div>
         <div className="text-base text-muted">
-          Start everything with <code className="rounded-lg bg-white px-2 py-1 font-semibold text-accent">npm run dev</code>
+          Simulation runs locally in this browser tab.
         </div>
       </div>
     );

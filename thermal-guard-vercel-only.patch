@@ -1,0 +1,1573 @@
+--- /dev/null
++++ b/client/src/local/service.ts
+@@ -0,0 +1,236 @@
++import type {
++  ActionId, FaultInfo, ScenarioId, SimulationSnapshot, ZoneForecast, ZoneId, ZoneState,
++} from '@shared/types';
++import {
++  AMBIENT_TEMP, DEFAULT_SPEED, GRID_H, GRID_W, HISTORY_LEN, HYSTERESIS, RECOVERY_BAND, SPEEDS, TICK_MS, ZONES,
++} from '@shared/zones';
++import { ACTIONS, getAction } from '@shared/actions';
++import { OutcomeTracker } from './actions/outcomeTracker';
++import { recommend } from './actions/recommender';
++import { FaultManager } from './faults/faultManager';
++import { AlertEngine } from './alerts/alertEngine';
++import { EarlyWarningTimeline } from './alerts/earlyWarningTimeline';
++import { Forecaster } from './forecasting/forecaster';
++import { ThermalSimulation } from './simulation/thermalSimulation';
++
++const round1 = (v: number) => Math.round(v * 10) / 10;
++
++/**
++ * The single owner of simulation state: thermal grid, incident, alerts, forecasts, timeline.
++ * Everything the dashboard shows comes out of `snapshot()`.
++ */
++export class SimulationService {
++  readonly sim = new ThermalSimulation();
++  readonly alerts = new AlertEngine();
++  readonly timeline = new EarlyWarningTimeline();
++  readonly forecaster = new Forecaster();
++  readonly outcome = new OutcomeTracker();
++  readonly faults = new FaultManager();
++
++  private histories = {} as Record<ZoneId, number[]>;
++  private forecasts = {} as Record<ZoneId, ZoneForecast>;
++  private peaks = {} as Record<ZoneId, number>;
++  private avgs = {} as Record<ZoneId, number>;
++  private nominal = {} as Record<ZoneId, number>;
++
++  paused = false;
++  speed: number = DEFAULT_SPEED;
++
++  constructor() {
++    this.reset();
++  }
++
++  async init(): Promise<void> {
++    await this.forecaster.load();
++    this.refreshDerived();
++  }
++
++  reset(): void {
++    this.sim.reset();
++    this.alerts.reset();
++    this.timeline.reset();
++    this.outcome.reset();
++    this.faults.reset();
++    const base = this.sim.getBaselinePeaks();
++    ZONES.forEach((z, i) => {
++      this.histories[z.id] = Array(HISTORY_LEN).fill(base[i]);
++      this.nominal[z.id] = base[i];
++    });
++    this.refreshDerived();
++  }
++
++  setScenario(scenario: ScenarioId, zoneId?: ZoneId): void {
++    const step = this.sim.step;
++    if (scenario !== 'normal') {
++      this.timeline.clearForNewIncident();
++      this.outcome.startIncident(step);
++      this.sim.setScenario(scenario, { zoneId });
++      if (scenario === 'cooling-failure') this.faults.open('cooling-pump', 'cooling', step);
++      else if (scenario === 'machine-overheating') this.faults.open('machine-bearing', 'production', step);
++      else this.faults.open('fire', zoneId ?? 'storage', step);
++    } else {
++      // NORMAL DAY: the symptoms clear, but every open issue stays open (equipment runs degraded).
++      this.outcome.noteRestore();
++      this.faults.normalDay();
++      this.sim.setScenario('normal');
++    }
++    this.faults.applyLevels(this.sim); // re-applies the effect of every open issue
++  }
++
++  /** Milliseconds of wall-clock time between simulation steps at the current speed. */
++  tickIntervalMs(): number {
++    return TICK_MS / this.speed;
++  }
++
++  control(p: { paused?: boolean; speed?: number; stepOnce?: boolean }): void {
++    if (typeof p.speed === 'number' && (SPEEDS as readonly number[]).includes(p.speed)) this.speed = p.speed;
++    if (typeof p.paused === 'boolean') this.paused = p.paused;
++    if (p.stepOnce && this.paused) this.tick();
++  }
++
++  /** Operator corrective action. Changes the real simulation and is logged for the outcome report. */
++  applyAction(actionId: ActionId, zoneId?: ZoneId, faultId?: string): void {
++    if (!ACTIONS.some((a) => a.id === actionId)) return;
++    const step = this.sim.step;
++    let ok = false;
++    switch (actionId) {
++      case 'restart-cooling': {
++        const f = this.faults.findUnresolved('cooling-pump');
++        if (f && !f.contained) { this.faults.contain(f, 'restart'); ok = true; }
++        break;
++      }
++      case 'reduce-load': {
++        const f = this.faults.findUnresolved('machine-bearing');
++        if (f && !f.contained) { this.faults.contain(f, 'reduce'); ok = true; }
++        break;
++      }
++      case 'shutdown-machine': {
++        const f = this.faults.findUnresolved('machine-bearing');
++        if (f && f.variant !== 'shutdown') { this.faults.contain(f, 'shutdown'); ok = true; }
++        break;
++      }
++      case 'sprinklers': {
++        const f = this.faults.findUnresolved('fire', zoneId);
++        if (f && !f.contained) { this.faults.contain(f, 'sprinklers'); ok = true; }
++        break;
++      }
++      case 'ventilate':
++        ok = this.sim.applyAction('ventilate', zoneId);
++        break;
++      case 'dispatch-technician': {
++        const f = faultId ? this.faults.get(faultId) : zoneId ? this.faults.firstUnresolvedInZone(zoneId) : undefined;
++        ok = this.faults.dispatch(f, step);
++        break;
++      }
++    }
++    if (!ok) return;
++    if (actionId !== 'ventilate' && actionId !== 'dispatch-technician') this.faults.applyLevels(this.sim);
++    this.outcome.noteAction(step, actionId, getAction(actionId).label, zoneId ?? null);
++  }
++
++  acknowledge(alertId: string): void {
++    this.alerts.acknowledge(alertId, this.sim.step);
++  }
++
++  tick(): void {
++    this.sim.tick();
++    const stats = this.sim.getZoneStats();
++    for (const s of stats) {
++      const h = this.histories[s.id];
++      h.push(s.peak);
++      if (h.length > HISTORY_LEN) h.shift();
++    }
++    this.refreshDerived();
++    const statuses = {} as Record<ZoneId, ReturnType<AlertEngine['getStatus']>>;
++    this.alerts.update(this.sim.step, this.peaks);
++    for (const z of ZONES) statuses[z.id] = this.alerts.getStatus(z.id);
++    this.timeline.update(this.sim.step, statuses, this.forecasts);
++    if (this.faults.update(this.sim.step, statuses)) this.faults.applyLevels(this.sim);
++    const warnSteps = this.timeline.getEntries().map((e) => e.aiWarningStep).filter((v): v is number => v !== null);
++    this.outcome.update(
++      this.sim.step, statuses, this.peaks, this.forecasts,
++      warnSteps.length ? Math.min(...warnSteps) : null,
++      this.faults.unresolvedCount(),
++      this.faults.failingCount(),
++    );
++  }
++
++  private refreshDerived(): void {
++    for (const s of this.sim.getZoneStats()) {
++      this.peaks[s.id] = s.peak;
++      this.avgs[s.id] = s.avg;
++    }
++    this.forecasts = this.forecaster.predict(this.histories);
++  }
++
++  private recoveryOf(id: ZoneId, zones: ZoneState[]) {
++    const zone = zones.find((q) => q.id === id)!;
++    if (zone.status === 'NORMAL') return [];
++    const targetTemp = zone.warningTemp - HYSTERESIS - RECOVERY_BAND;
++    const phase = zone.trend < -0.05 ? 'cooling' : zone.trend > 0.05 ? 'heating' : 'steady';
++    const etaSteps =
++      phase === 'cooling' && zone.peakTemp > targetTemp
++        ? Math.min(999, Math.ceil((zone.peakTemp - targetTemp) / -zone.trend))
++        : null;
++    return [{ zoneId: id, phase, peakTemp: zone.peakTemp, targetTemp, trend: zone.trend, etaSteps }] as const;
++  }
++
++  private currentFaults(): FaultInfo[] {
++    const statuses = {} as Record<ZoneId, ReturnType<AlertEngine['getStatus']>>;
++    for (const z of ZONES) statuses[z.id] = this.alerts.getStatus(z.id);
++    return this.faults.infos(statuses, this.sim.getCauses(), this.sim.step);
++  }
++
++  private currentRecommendations() {
++    const statuses = {} as Record<ZoneId, ReturnType<AlertEngine['getStatus']>>;
++    for (const z of ZONES) statuses[z.id] = this.alerts.getStatus(z.id);
++    return recommend(statuses, this.forecasts, this.currentFaults());
++  }
++
++  snapshot(): SimulationSnapshot {
++    const values = Array.from(this.sim.grid, round1);
++    let minTemp = Infinity;
++    let maxTemp = -Infinity;
++    for (const v of values) {
++      if (v < minTemp) minTemp = v;
++      if (v > maxTemp) maxTemp = v;
++    }
++    const zones: ZoneState[] = ZONES.map((z) => {
++      const h = this.histories[z.id];
++      const n = h.length;
++      return {
++        id: z.id,
++        name: z.name,
++        avgTemp: round1(this.avgs[z.id]),
++        peakTemp: round1(this.peaks[z.id]),
++        limit: z.limit,
++        warningTemp: z.limit - z.warningMargin,
++        nominalTemp: round1(this.nominal[z.id]),
++        status: this.alerts.getStatus(z.id),
++        trend: Math.round(((h[n - 1] - h[n - 6]) / 5) * 1000) / 1000,
++        history: h.map(round1),
++      };
++    });
++    return {
++      step: this.sim.step,
++      control: { paused: this.paused, speed: this.speed },
++      actions: this.outcome.getActions(),
++      recommendations: this.currentRecommendations(),
++      faults: this.currentFaults(),
++      recovery: ZONES.flatMap((z) => this.recoveryOf(z.id, zones)),
++      outcome: this.outcome.getReport(),
++      serverTime: Date.now(),
++      ambient: AMBIENT_TEMP,
++      grid: { width: GRID_W, height: GRID_H, values },
++      minTemp,
++      maxTemp,
++      zones,
++      forecasts: ZONES.map((z) => this.forecasts[z.id]),
++      model: this.forecaster.status,
++      incident: this.sim.getIncident(),
++      alerts: this.alerts.getAlerts(),
++      predictions: this.timeline.getEvents(),
++      timeline: this.timeline.getEntries(),
++    };
++  }
++}
+--- /dev/null
++++ b/client/src/local/actions/recommender.ts
+@@ -0,0 +1,56 @@
++import type {
++  FaultInfo, Recommendation, ZoneForecast, ZoneId, ZoneStatus,
++} from '@shared/types';
++import { ZONES } from '@shared/zones';
++
++/**
++ * Rule-based suggestions. Plain "if this, then that", written by us. It is NOT machine learning.
++ *
++ *  - A live problem  -> suggest the online fix first.
++ *  - A contained one -> suggest sending a technician, because the online fix is only temporary.
++ *  - A hot zone with no known cause -> suggest extra ventilation while someone inspects.
++ */
++export function recommend(
++  statuses: Record<ZoneId, ZoneStatus>,
++  forecasts: Record<ZoneId, ZoneForecast>,
++  faults: FaultInfo[],
++): Recommendation[] {
++  const out: Recommendation[] = [];
++  const add = (r: Recommendation) => {
++    if (!out.some((x) => x.actionId === r.actionId && x.zoneId === r.zoneId)) out.push(r);
++  };
++
++  for (const f of faults) {
++    if (f.state === 'fixed') continue;
++    const status = statuses[f.zoneId];
++    const urgency: Recommendation['urgency'] = status === 'CRITICAL' || status === 'WARNING' ? 'now' : 'soon';
++    // Suggest the online fix once the zone is actually in trouble (rule status or a forecast warning).
++    const inTrouble = status !== 'NORMAL' || forecasts[f.zoneId].warning;
++
++    if (f.state === 'failing' && inTrouble) {
++      if (f.kind === 'cooling-pump') add({ actionId: 'restart-cooling', zoneId: f.zoneId, faultId: f.id, urgency, reason: f.summary });
++      if (f.kind === 'machine-bearing') {
++        add({ actionId: 'reduce-load', zoneId: f.zoneId, faultId: f.id, urgency, reason: f.summary });
++        if (status === 'CRITICAL') {
++          add({ actionId: 'shutdown-machine', zoneId: f.zoneId, faultId: f.id, urgency: 'now', reason: 'The limit is already crossed and the machine is still overloaded.' });
++        }
++      }
++      if (f.kind === 'fire') add({ actionId: 'sprinklers', zoneId: f.zoneId, faultId: f.id, urgency: 'now', reason: f.summary });
++    } else if (f.state === 'contained' && f.canDispatch) {
++      add({
++        actionId: 'dispatch-technician', zoneId: f.zoneId, faultId: f.id, urgency: 'soon',
++        reason: `The online fix is only temporary. ${f.summary}`,
++      });
++    }
++  }
++
++  // Hot zone, but nothing in the fault list explains it.
++  for (const zone of ZONES) {
++    const hot = statuses[zone.id] === 'CRITICAL' || statuses[zone.id] === 'WARNING' || forecasts[zone.id].warning;
++    if (hot && !out.some((r) => r.zoneId === zone.id)) {
++      add({ actionId: 'ventilate', zoneId: zone.id, urgency: 'now', reason: 'No single cause found. Extra airflow can help while you inspect.' });
++    }
++  }
++  out.sort((a, b) => (a.urgency === b.urgency ? 0 : a.urgency === 'now' ? -1 : 1));
++  return out.slice(0, 3);
++}
+--- /dev/null
++++ b/client/src/local/actions/outcomeTracker.ts
+@@ -0,0 +1,137 @@
++import type {
++  ActionRecord, OutcomeReport, ZoneForecast, ZoneId, ZoneStatus,
++} from '@shared/types';
++import { ZONES } from '@shared/zones';
++
++const idle = (): OutcomeReport => ({
++  status: 'idle', startedStep: null, closedStep: null, breached: false, stepsAboveLimit: 0,
++  peakOverLimit: null, firstActionStep: null, aiWarningStep: null, reactionSteps: null,
++  closedBy: null, openIssues: 0, headline: '', detail: '',
++});
++
++/**
++ * Scores how an incident went, from facts only:
++ *   did any zone cross its limit, for how many steps, by how much,
++ *   what was done, and how long after the first warning.
++ */
++export class OutcomeTracker {
++  private report: OutcomeReport = idle();
++  private actions: ActionRecord[] = [];
++  private seenTrouble = false;
++  private restored = false;
++  private counter = 0;
++
++  reset(): void {
++    this.report = idle();
++    this.actions = [];
++    this.seenTrouble = false;
++    this.restored = false;
++    this.counter = 0;
++  }
++
++  getActions(): ActionRecord[] {
++    return this.actions.map((a) => ({ ...a }));
++  }
++
++  getReport(): OutcomeReport {
++    return { ...this.report };
++  }
++
++  startIncident(step: number): void {
++    this.reset();
++    this.report.status = 'in-progress';
++    this.report.startedStep = step;
++  }
++
++  /** Operator pressed the NORMAL OPERATION test button (this is not a corrective action). */
++  noteRestore(): void {
++    if (this.report.status !== 'in-progress') return;
++    this.restored = true;
++    if (!this.seenTrouble) this.report = idle();
++  }
++
++  noteAction(step: number, actionId: ActionRecord['actionId'], label: string, zoneId: ZoneId | null): void {
++    this.actions.push({ id: `X${++this.counter}`, step, actionId, label, zoneId });
++    if (this.report.status === 'in-progress' && this.report.firstActionStep === null) {
++      this.report.firstActionStep = step;
++    }
++  }
++
++  update(
++    step: number,
++    statuses: Record<ZoneId, ZoneStatus>,
++    peaks: Record<ZoneId, number>,
++    forecasts: Record<ZoneId, ZoneForecast>,
++    aiWarningStep: number | null,
++    openIssues: number,
++    failingIssues: number,
++  ): void {
++    const r = this.report;
++    if (r.status === 'closed') {
++      // keep the "open issues" part of the report live after the incident closed
++      r.openIssues = openIssues;
++      this.writeText();
++      return;
++    }
++    if (r.status !== 'in-progress') return;
++    r.aiWarningStep = aiWarningStep;
++
++    let anyCritical = false;
++    let anyTrouble = false;
++    for (const z of ZONES) {
++      const st = statuses[z.id];
++      if (st !== 'NORMAL' || forecasts[z.id].warning) anyTrouble = true;
++      if (st === 'CRITICAL') {
++        anyCritical = true;
++        r.peakOverLimit = Math.max(r.peakOverLimit ?? 0, peaks[z.id] - z.limit);
++      }
++    }
++    if (anyTrouble) this.seenTrouble = true;
++    if (anyCritical) {
++      r.breached = true;
++      r.stepsAboveLimit++;
++    }
++
++    const calm = ZONES.every((z) => statuses[z.id] === 'NORMAL' && !forecasts[z.id].warning);
++    // Closed when everything is calm and no problem is still live. A fix applied before any alarm counts too.
++    const handled = this.seenTrouble || this.actions.length > 0 || this.restored;
++    if (handled && calm && failingIssues === 0 && step > (r.startedStep ?? 0) + 3) {
++      r.status = 'closed';
++      r.closedStep = step;
++      r.openIssues = openIssues;
++      r.closedBy = this.actions.length > 0 ? 'actions' : this.restored ? 'restore' : 'recovered';
++      if (r.firstActionStep !== null && r.aiWarningStep !== null) r.reactionSteps = r.firstActionStep - r.aiWarningStep;
++    }
++    this.writeText();
++  }
++
++  private writeText(): void {
++    const r = this.report;
++    const acts = this.actions.map((a) => `${a.label} (step ${a.step})`).join(', ');
++    if (r.status === 'in-progress') {
++      r.headline = r.breached ? 'Limit crossed, incident still active' : 'Incident in progress';
++      const so = r.breached ? `So far: ${r.stepsAboveLimit} steps above the limit. ` : '';
++      r.detail = so + (this.actions.length ? `Actions so far: ${acts}.` : 'No corrective action taken yet.');
++      return;
++    }
++    r.headline = r.breached
++      ? `Limit was crossed for ${r.stepsAboveLimit} steps`
++      : 'Breach avoided';
++    const parts: string[] = [];
++    if (r.breached && r.peakOverLimit !== null) parts.push(`The worst zone reached ${r.peakOverLimit.toFixed(1)}°C above its limit.`);
++    if (r.closedBy === 'actions') parts.push(`Actions: ${acts}.`);
++    if (r.closedBy === 'restore') parts.push('No corrective action was taken; conditions were restored with the NORMAL OPERATION test button.');
++    if (r.closedBy === 'recovered') parts.push('No corrective action was taken; the incident passed by itself.');
++    if (r.aiWarningStep !== null && r.firstActionStep !== null && r.reactionSteps !== null) {
++      parts.push(
++        r.reactionSteps >= 0
++          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} steps to react.`
++          : `First action (step ${r.firstActionStep}) came before the forecast warning was confirmed (step ${r.aiWarningStep}).`,
++      );
++    }
++    if (r.openIssues > 0) {
++      parts.push(`${r.openIssues} ${r.openIssues === 1 ? 'issue still needs' : 'issues still need'} an on-site repair (see the Fix Center).`);
++    }
++    r.detail = parts.join(' ');
++  }
++}
+--- /dev/null
++++ b/client/src/local/faults/faultManager.ts
+@@ -0,0 +1,220 @@
++import type { ActionId, FaultInfo, FaultKind, ZoneId, ZoneStatus } from '@shared/types';
++import { ZONES, getZone } from '@shared/zones';
++import {
++  DEFAULT_COOLING_FAILURE_EFFECTIVENESS, DEFAULT_FIRE_INTENSITY, DEFAULT_OVERHEAT_MULTIPLIER,
++  DEGRADED_COOLING_EFFECTIVENESS, REDUCED_LOAD_MULTIPLIER,
++} from '../simulation/config';
++import type { ThermalSimulation } from '../simulation/thermalSimulation';
++
++type Variant = 'none' | 'restart' | 'reduce' | 'shutdown' | 'sprinklers' | 'normal-day';
++type JobPhase = 'none' | 'travelling' | 'waiting' | 'repairing';
++
++interface Fault {
++  id: string;
++  kind: FaultKind;
++  zoneId: ZoneId;
++  /** true once the symptoms are under control (online fix or "normal day"). The issue is still open. */
++  contained: boolean;
++  variant: Variant;
++  resolved: boolean;
++  openedStep: number;
++  resolvedStep: number | null;
++  job: { phase: JobPhase; endStep: number | null };
++}
++
++const TRAVEL_STEPS = 20;
++const REPAIR_STEPS: Record<FaultKind, number> = { 'cooling-pump': 25, 'machine-bearing': 30, fire: 15 };
++const MACHINE = 'machine-a';
++
++export interface Causes {
++  coolingEffectiveness: number;
++  machineMultiplier: number;
++}
++
++/**
++ * Tracks the ROOT CAUSE behind each incident.
++ *
++ *  failing    -> the problem is live (temperatures rise).
++ *  contained  -> an online fix (or the NORMAL DAY button) stopped the symptoms, but the equipment
++ *                still runs degraded. The issue stays open.
++ *  technician -> travelling, waiting for safe conditions, repairing, then fixed for good.
++ */
++export class FaultManager {
++  private faults: Fault[] = [];
++  private counter = 0;
++
++  reset(): void {
++    this.faults = [];
++    this.counter = 0;
++  }
++
++  unresolvedCount(): number {
++    return this.faults.filter((f) => !f.resolved).length;
++  }
++
++  /** Open issues whose symptoms are NOT under control yet. */
++  failingCount(): number {
++    return this.faults.filter((f) => !f.resolved && !f.contained).length;
++  }
++
++  get(id: string): Fault | undefined {
++    return this.faults.find((f) => f.id === id);
++  }
++
++  findUnresolved(kind: FaultKind, zoneId?: ZoneId): Fault | undefined {
++    return this.faults.find((f) => !f.resolved && f.kind === kind && (!zoneId || f.zoneId === zoneId));
++  }
++
++  firstUnresolvedInZone(zoneId: ZoneId): Fault | undefined {
++    return this.faults.find((f) => !f.resolved && f.zoneId === zoneId && f.job.phase === 'none');
++  }
++
++  /** An incident starts (or starts again): the problem is live. */
++  open(kind: FaultKind, zoneId: ZoneId, step: number): Fault {
++    let f = this.faults.find((x) => x.kind === kind && x.zoneId === zoneId);
++    if (!f) {
++      f = {
++        id: `F${++this.counter}`, kind, zoneId, contained: false, variant: 'none', resolved: false,
++        openedStep: step, resolvedStep: null, job: { phase: 'none', endStep: null },
++      };
++      this.faults.unshift(f);
++    }
++    f.contained = false;
++    f.variant = 'none';
++    f.resolved = false;
++    f.resolvedStep = null;
++    f.openedStep = step;
++    f.job = { phase: 'none', endStep: null }; // a new failure cancels any repair in progress
++    return f;
++  }
++
++  contain(f: Fault, variant: Variant): void {
++    f.contained = true;
++    f.variant = variant;
++  }
++
++  /** NORMAL DAY: symptoms clear, but every open issue stays open. */
++  normalDay(): void {
++    for (const f of this.faults) if (!f.resolved && !f.contained) this.contain(f, 'normal-day');
++  }
++
++  dispatch(f: Fault | undefined, step: number): boolean {
++    if (!f || f.resolved || f.job.phase !== 'none') return false;
++    f.job = { phase: 'travelling', endStep: step + TRAVEL_STEPS };
++    return true;
++  }
++
++  /** Moves technician jobs forward. Returns true when a repair finished (levels must be re-applied). */
++  update(step: number, statuses: Record<ZoneId, ZoneStatus>): boolean {
++    let finished = false;
++    for (const f of this.faults) {
++      if (f.resolved) continue;
++      const job = f.job;
++      if (job.phase === 'travelling' && job.endStep !== null && step >= job.endStep) {
++        job.phase = 'waiting';
++        job.endStep = null;
++      }
++      if (job.phase === 'waiting' && f.contained && statuses[f.zoneId] !== 'CRITICAL') {
++        job.phase = 'repairing';
++        job.endStep = step + REPAIR_STEPS[f.kind];
++      }
++      if (job.phase === 'repairing' && job.endStep !== null && step >= job.endStep) {
++        f.resolved = true;
++        f.resolvedStep = step;
++        f.job = { phase: 'none', endStep: null };
++        finished = true;
++      }
++    }
++    return finished;
++  }
++
++  /** Writes the effect of every open issue into the simulation. Call it whenever something changes. */
++  applyLevels(sim: ThermalSimulation): void {
++    let cooling = 1;
++    let machine = 1;
++    for (const f of this.faults) {
++      if (f.resolved) continue;
++      if (f.kind === 'cooling-pump') {
++        cooling = f.contained ? DEGRADED_COOLING_EFFECTIVENESS : DEFAULT_COOLING_FAILURE_EFFECTIVENESS;
++      } else if (f.kind === 'machine-bearing') {
++        machine = !f.contained ? DEFAULT_OVERHEAT_MULTIPLIER : f.variant === 'shutdown' ? 0 : REDUCED_LOAD_MULTIPLIER;
++      } else {
++        sim.setFire(f.zoneId, f.contained ? 0 : DEFAULT_FIRE_INTENSITY, f.contained);
++      }
++    }
++    sim.setCoolingTarget(cooling);
++    sim.setMachineTarget(MACHINE, machine);
++  }
++
++  infos(statuses: Record<ZoneId, ZoneStatus>, causes: Causes, step: number): FaultInfo[] {
++    const open = this.faults.filter((f) => !f.resolved);
++    const done = this.faults.filter((f) => f.resolved).slice(0, 3);
++    return [...open, ...done].map((f) => this.describe(f, statuses, causes, step));
++  }
++
++  private describe(f: Fault, statuses: Record<ZoneId, ZoneStatus>, causes: Causes, step: number): FaultInfo {
++    const zoneName = getZone(f.zoneId).name;
++    const left = f.job.endStep !== null ? Math.max(0, f.job.endStep - step) : null;
++    const title =
++      f.kind === 'cooling-pump' ? 'Cooling pump fault'
++        : f.kind === 'machine-bearing' ? 'Machine A bearing overheating'
++          : `Fire in ${zoneName}`;
++
++    let summary = '';
++    if (f.resolved) {
++      summary = f.kind === 'cooling-pump' ? 'Repaired. Cooling is back to full power.'
++        : f.kind === 'machine-bearing' ? 'Bearing repaired. The machine runs at its normal load.'
++          : 'Area inspected and cleared.';
++    } else if (!f.contained) {
++      summary = f.kind === 'cooling-pump'
++        ? `Cooling output has dropped to ${Math.round(causes.coolingEffectiveness * 100)}% of normal.`
++        : f.kind === 'machine-bearing'
++          ? `Machine A is producing ${causes.machineMultiplier.toFixed(1)}× its normal heat.`
++          : `A fire is burning in ${zoneName}.`;
++    } else {
++      summary = f.kind === 'cooling-pump'
++        ? 'Cooling runs at reduced power (about 70%). The pump still needs repair for full cooling.'
++        : f.kind === 'machine-bearing'
++          ? f.variant === 'shutdown'
++            ? 'Machine A is stopped. Production on it is halted until the bearing is repaired.'
++            : 'Symptoms are under control, but Machine A still runs at a reduced load. The bearing needs repair.'
++          : 'The fire is out, but the area still needs a safety inspection.';
++    }
++
++    let state: FaultInfo['state'];
++    let note = '';
++    if (f.resolved) state = 'fixed';
++    else if (f.job.phase === 'travelling') {
++      state = 'travelling';
++      note = `Technician is on the way, arriving in about ${left} steps.`;
++    } else if (f.job.phase === 'waiting') {
++      state = 'waiting';
++      note = !f.contained
++        ? 'Technician is on site but cannot start: the problem is still active. Use an online fix first.'
++        : 'Technician is on site, waiting until the zone is no longer above its limit.';
++    } else if (f.job.phase === 'repairing') {
++      state = 'repairing';
++      note = `Repair in progress, about ${left} steps left.`;
++    } else state = f.contained ? 'contained' : 'failing';
++
++    const onlineFixes: ActionId[] = [];
++    if (!f.resolved) {
++      if (f.kind === 'cooling-pump' && !f.contained) onlineFixes.push('restart-cooling');
++      if (f.kind === 'machine-bearing') {
++        if (!f.contained) onlineFixes.push('reduce-load');
++        if (f.variant !== 'shutdown') onlineFixes.push('shutdown-machine');
++      }
++      if (f.kind === 'fire' && !f.contained) onlineFixes.push('sprinklers');
++      onlineFixes.push('ventilate');
++    }
++    void statuses;
++    return {
++      id: f.id, kind: f.kind, zoneId: f.zoneId, title, state, summary, onlineFixes,
++      canDispatch: !f.resolved && f.job.phase === 'none',
++      jobStepsLeft: f.job.phase === 'travelling' || f.job.phase === 'repairing' ? left : null,
++      note, openedStep: f.openedStep, resolvedStep: f.resolvedStep,
++    };
++  }
++}
++
++export const ALL_ZONE_IDS = ZONES.map((z) => z.id);
+--- /dev/null
++++ b/client/src/local/alerts/alertEngine.ts
+@@ -0,0 +1,124 @@
++import type { Alert, ZoneId, ZoneStatus } from '@shared/types';
++import { HYSTERESIS, RECOVERY_BAND, ZONES } from '@shared/zones';
++
++const MAX_ALERTS = 40;
++
++interface ZoneRuleState {
++  status: ZoneStatus;
++  alertId: string | null;
++}
++
++/**
++ * Rule-based alert engine (no AI involved).
++ *
++ *   NORMAL     -> WARNING    when peak >= limit - margin
++ *   NORMAL/WARNING -> CRITICAL when peak >= limit   (an actual breach)
++ *   CRITICAL   -> RECOVERING when peak < limit - HYSTERESIS
++ *   WARNING    -> RECOVERING when peak < warning - HYSTERESIS
++ *   RECOVERING -> NORMAL     when peak < warning - HYSTERESIS - RECOVERY_BAND
++ *   RECOVERING -> CRITICAL   if the limit is crossed again
++ *
++ * One alert object per incident per zone: it escalates (warning -> critical) instead of
++ * creating duplicates, and is resolved when the zone is back to NORMAL.
++ */
++export class AlertEngine {
++  private zones = new Map<ZoneId, ZoneRuleState>();
++  private alerts: Alert[] = [];
++  private counter = 0;
++
++  constructor() {
++    this.reset();
++  }
++
++  reset(): void {
++    this.zones.clear();
++    for (const z of ZONES) this.zones.set(z.id, { status: 'NORMAL', alertId: null });
++    this.alerts = [];
++    this.counter = 0;
++  }
++
++  getStatus(id: ZoneId): ZoneStatus {
++    return this.zones.get(id)!.status;
++  }
++
++  getAlerts(): Alert[] {
++    return this.alerts.map((a) => ({ ...a }));
++  }
++
++  acknowledge(alertId: string, step: number): void {
++    const a = this.alerts.find((x) => x.id === alertId);
++    if (a && !a.acknowledged) {
++      a.acknowledged = true;
++      a.acknowledgedStep = step;
++    }
++  }
++
++  update(step: number, peaks: Record<ZoneId, number>): void {
++    for (const zone of ZONES) {
++      const peak = peaks[zone.id];
++      const st = this.zones.get(zone.id)!;
++      const warnT = zone.limit - zone.warningMargin;
++      const alert = st.alertId ? this.alerts.find((a) => a.id === st.alertId) : undefined;
++      const prev = st.status;
++      let next: ZoneStatus = prev;
++
++      switch (prev) {
++        case 'NORMAL':
++          if (peak >= zone.limit) next = 'CRITICAL';
++          else if (peak >= warnT) next = 'WARNING';
++          break;
++        case 'WARNING':
++          if (peak >= zone.limit) next = 'CRITICAL';
++          else if (peak < warnT - HYSTERESIS) next = 'RECOVERING';
++          break;
++        case 'CRITICAL':
++          if (peak < zone.limit - HYSTERESIS) next = 'RECOVERING';
++          break;
++        case 'RECOVERING':
++          if (peak >= zone.limit) next = 'CRITICAL';
++          else if (peak < warnT - HYSTERESIS - RECOVERY_BAND) next = 'NORMAL';
++          break;
++      }
++
++      // Open a new alert only when a new incident starts.
++      if (prev === 'NORMAL' && next !== 'NORMAL') {
++        const id = `A${++this.counter}`;
++        const critical = next === 'CRITICAL';
++        const a: Alert = {
++          id, zoneId: zone.id, zoneName: zone.name,
++          severity: critical ? 'critical' : 'warning',
++          state: 'active',
++          openedStep: step,
++          criticalStep: critical ? step : null,
++          resolvedStep: null,
++          peakTemp: peak,
++          limit: zone.limit,
++          acknowledged: false,
++          acknowledgedStep: null,
++          message: critical
++            ? `${zone.name} crossed its ${zone.limit}°C limit`
++            : `${zone.name} is above its warning level (${warnT}°C)`,
++        };
++        this.alerts.unshift(a);
++        if (this.alerts.length > MAX_ALERTS) this.alerts.pop();
++        st.alertId = id;
++      } else if (alert) {
++        alert.peakTemp = Math.max(alert.peakTemp, peak);
++        if (next === 'CRITICAL' && alert.criticalStep === null) {
++          alert.criticalStep = step;
++          alert.severity = 'critical';
++          alert.message = `${zone.name} crossed its ${zone.limit}°C limit`;
++        }
++        if (next === 'CRITICAL') alert.state = 'active';
++        if (next === 'WARNING') alert.state = 'active';
++        if (next === 'RECOVERING') alert.state = 'recovering';
++        if (next === 'NORMAL') {
++          alert.state = 'resolved';
++          alert.resolvedStep = step;
++          st.alertId = null;
++        }
++      }
++      st.status = next;
++    }
++  }
++}
+--- /dev/null
++++ b/client/src/local/alerts/earlyWarningTimeline.ts
+@@ -0,0 +1,171 @@
++import type {
++  ForecastSource, PredictionEvent, TimelineEntry, ZoneForecast, ZoneId, ZoneStatus,
++} from '@shared/types';
++import { AI_CONFIRM_STEPS, ZONES, getZone } from '@shared/zones';
++
++const MAX_ENTRIES = 12;
++const MAX_EVENTS = 30;
++
++interface ZoneTrack {
++  streak: number;
++  /** Consecutive steps with the zone NORMAL and no active forecast warning. */
++  clearTicks: number;
++  entryId: string | null;
++}
++
++/** An entry is closed after this many calm steps in a row (avoids flicker creating duplicates). */
++const CLOSE_AFTER_CLEAR_STEPS = 6;
++
++/**
++ * PREDICTIVE EARLY WARNING TIMELINE
++ *
++ * Records two events per incident and zone:
++ *   A. the step where a forecast warning was CONFIRMED (AI_CONFIRM_STEPS steps in a row)
++ *      while the zone was still below its limit,
++ *   B. the step where the actual configured limit was crossed (rule engine = CRITICAL).
++ *
++ * Lead = B - A. Nothing here is scripted: if no warning came before the breach, or no breach
++ * happened, the entry says so.
++ */
++export class EarlyWarningTimeline {
++  private entries: TimelineEntry[] = [];
++  private events: PredictionEvent[] = [];
++  private tracks = new Map<ZoneId, ZoneTrack>();
++  private counter = 0;
++  private eventCounter = 0;
++
++  constructor() {
++    this.reset();
++  }
++
++  reset(): void {
++    this.entries = [];
++    this.events = [];
++    this.counter = 0;
++    this.eventCounter = 0;
++    this.tracks.clear();
++    for (const z of ZONES) this.tracks.set(z.id, { streak: 0, clearTicks: 0, entryId: null });
++  }
++
++  /** Called when the operator starts a new incident, so the demo timeline starts fresh. */
++  clearForNewIncident(): void {
++    this.entries = [];
++    for (const t of this.tracks.values()) {
++      t.streak = 0;
++      t.clearTicks = 0;
++      t.entryId = null;
++    }
++  }
++
++  getEntries(): TimelineEntry[] {
++    return this.entries.map((e) => ({ ...e }));
++  }
++
++  getEvents(): PredictionEvent[] {
++    return this.events.map((e) => ({ ...e }));
++  }
++
++  update(
++    step: number,
++    statuses: Record<ZoneId, ZoneStatus>,
++    forecasts: Record<ZoneId, ZoneForecast>,
++  ): void {
++    for (const zone of ZONES) {
++      const track = this.tracks.get(zone.id)!;
++      const status = statuses[zone.id];
++      const fc = forecasts[zone.id];
++      let entry = track.entryId ? this.entries.find((e) => e.id === track.entryId) : undefined;
++
++      // --- Event A: confirmed forecast warning, only while still below the limit ---
++      if (status !== 'CRITICAL' && fc.warning) track.streak++;
++      else if (status !== 'CRITICAL') track.streak = 0;
++
++      if (
++        track.streak >= AI_CONFIRM_STEPS &&
++        (!entry || (entry.aiWarningStep === null && entry.breachStep === null))
++      ) {
++        if (!entry) entry = this.openEntry(zone.id, step, track);
++        entry.aiWarningStep = step;
++        entry.aiWarningSource = fc.source;
++        entry.aiWarningRisk = fc.riskScore;
++        this.pushEvent(zone.id, step, fc.source, fc.riskScore);
++      }
++
++      // --- Event B: actual breach by the rule engine ---
++      if (status === 'CRITICAL') {
++        if (!entry) entry = this.openEntry(zone.id, step, track);
++        if (entry.breachStep === null) entry.breachStep = step;
++      }
++
++      // --- close the entry when the zone is back to NORMAL ---
++      if (status === 'NORMAL' && !fc.warning) track.clearTicks++;
++      else track.clearTicks = 0;
++      if (entry && entry.resolvedStep === null && track.clearTicks >= CLOSE_AFTER_CLEAR_STEPS) {
++        entry.resolvedStep = step;
++        track.entryId = null;
++        track.streak = 0;
++      }
++
++      if (entry) this.refresh(entry);
++    }
++  }
++
++  private openEntry(zoneId: ZoneId, step: number, track: ZoneTrack): TimelineEntry {
++    const entry: TimelineEntry = {
++      id: `T${++this.counter}`,
++      zoneId,
++      zoneName: getZone(zoneId).name,
++      startedStep: step,
++      aiWarningStep: null,
++      aiWarningSource: null,
++      aiWarningRisk: null,
++      breachStep: null,
++      resolvedStep: null,
++      leadSteps: null,
++      verdict: 'ai-warning-pending',
++      summary: '',
++    };
++    this.entries.unshift(entry);
++    if (this.entries.length > MAX_ENTRIES) this.entries.pop();
++    track.entryId = entry.id;
++    return entry;
++  }
++
++  private pushEvent(zoneId: ZoneId, step: number, source: ForecastSource, risk: number | null): void {
++    const name = getZone(zoneId).name;
++    const who = source === 'neural-network' ? 'AI forecast' : 'Trend estimate (not AI)';
++    this.events.unshift({
++      id: `P${++this.eventCounter}`,
++      zoneId, zoneName: name, step, source, riskScore: risk,
++      message: `${who}: possible breach of the ${name} limit within 30 steps`,
++    });
++    if (this.events.length > MAX_EVENTS) this.events.pop();
++  }
++
++  private refresh(e: TimelineEntry): void {
++    const src = e.aiWarningSource === 'trend-fallback' ? 'Trend estimate (not AI)' : 'AI forecast';
++    if (e.breachStep !== null && e.aiWarningStep !== null) {
++      e.leadSteps = e.breachStep - e.aiWarningStep;
++      if (e.leadSteps > 0) {
++        e.verdict = 'early-warning';
++        e.summary = `${src} at step ${e.aiWarningStep}; limit crossed at step ${e.breachStep}. Early warning lead: ${e.leadSteps} simulation steps.`;
++      } else {
++        e.verdict = 'no-advance-notice';
++        e.summary = `Warning and breach in the same step (${e.breachStep}). No advance notice.`;
++      }
++    } else if (e.breachStep !== null) {
++      e.leadSteps = null;
++      e.verdict = 'no-warning-before-breach';
++      e.summary = `Limit crossed at step ${e.breachStep}. The forecast gave no confirmed warning before it: only the reactive threshold alarm fired.`;
++    } else if (e.aiWarningStep !== null) {
++      e.leadSteps = null;
++      if (e.resolvedStep !== null) {
++        e.verdict = 'warning-without-breach';
++        e.summary = `${src} at step ${e.aiWarningStep}, but the limit was never crossed (zone back to normal at step ${e.resolvedStep}).`;
++      } else {
++        e.verdict = 'ai-warning-pending';
++        e.summary = `${src} at step ${e.aiWarningStep}. Waiting to see whether the limit is crossed.`;
++      }
++    }
++  }
++}
+--- /dev/null
++++ b/client/src/local/simulation/config.ts
+@@ -0,0 +1,46 @@
++import type { ZoneId } from '@shared/types';
++
++// Physics constants for the 40 x 25 thermal grid. One tick = one fixed step.
++export const ALPHA = 0.16; // how strongly a cell blends with its neighbours (diffusion)
++export const K_BASE = 0.018; // loss to ambient everywhere
++export const K_COOL_LOCAL = 0.08; // extra loss inside the cooling unit zone (scaled by cooling effectiveness)
++export const K_COOL_HALO = 0.004; // small cooling effect elsewhere (facility air) (scaled by effectiveness)
++export const K_SUPPRESS = 0.05; // extra loss while a fire zone is being brought under control
++export const K_VENT = 0.03; // extra loss in a zone while boosted ventilation is on
++export const DEGRADED_COOLING_EFFECTIVENESS = 0.7; // cooling after a remote restart, until it is repaired
++export const REDUCED_LOAD_MULTIPLIER = 1.2; // machine heat output after 'reduce load'
++export const MAX_TEMP = 400;
++export const WARMUP_STEPS = 900;
++
++export type SourceKind = 'static' | 'machine' | 'compressor';
++
++export interface HeatSource {
++  id: string;
++  zoneId: ZoneId;
++  /** Position in grid cells. */
++  x: number;
++  y: number;
++  radius: number;
++  /** Peak heating in degrees C per step at the centre, at normal operation. */
++  power: number;
++  kind: SourceKind;
++}
++
++export const HEAT_SOURCES: HeatSource[] = [
++  { id: 'boiler-core', zoneId: 'boiler', x: 5.5, y: 4.5, radius: 3.6, power: 1.7, kind: 'static' },
++  { id: 'machine-a', zoneId: 'production', x: 17.5, y: 6, radius: 3, power: 1.0, kind: 'machine' },
++  { id: 'machine-b', zoneId: 'production', x: 23, y: 6, radius: 3, power: 1.0, kind: 'machine' },
++  { id: 'compressor', zoneId: 'cooling', x: 33.5, y: 6, radius: 3.5, power: 0.8, kind: 'compressor' },
++  { id: 'cabinet-a', zoneId: 'electrical', x: 17.5, y: 18.5, radius: 2.6, power: 0.7, kind: 'static' },
++  { id: 'cabinet-b', zoneId: 'electrical', x: 23, y: 18.5, radius: 2.6, power: 0.7, kind: 'static' },
++  { id: 'motor-a', zoneId: 'packaging', x: 31, y: 18.5, radius: 2.6, power: 0.38, kind: 'static' },
++  { id: 'motor-b', zoneId: 'packaging', x: 36, y: 18.5, radius: 2.6, power: 0.38, kind: 'static' },
++];
++
++export const FIRE_RADIUS = 2.8;
++export const FIRE_POWER = 3.2; // degrees C per step at the centre when intensity = 1
++
++// Default scenario severities.
++export const DEFAULT_COOLING_FAILURE_EFFECTIVENESS = 0.03;
++export const DEFAULT_OVERHEAT_MULTIPLIER = 2.8;
++export const DEFAULT_FIRE_INTENSITY = 1.0;
+--- /dev/null
++++ b/client/src/local/simulation/thermalSimulation.ts
+@@ -0,0 +1,337 @@
++import type { ActionId, IncidentInfo, ScenarioId, ZoneId } from '@shared/types';
++import {
++  AMBIENT_TEMP, GRID_H, GRID_W, ZONES, getZone, zoneIndex, zoneIndexOfCell,
++} from '@shared/zones';
++import {
++  ALPHA, DEFAULT_COOLING_FAILURE_EFFECTIVENESS, DEFAULT_FIRE_INTENSITY,
++  DEFAULT_OVERHEAT_MULTIPLIER, FIRE_POWER, FIRE_RADIUS, HEAT_SOURCES, K_BASE,
++  K_COOL_HALO, K_COOL_LOCAL, K_SUPPRESS, K_VENT, MAX_TEMP, REDUCED_LOAD_MULTIPLIER, WARMUP_STEPS,
++} from './config';
++
++const N = GRID_W * GRID_H;
++const COOLING_IDX = zoneIndex('cooling');
++
++export interface ZoneStat {
++  id: ZoneId;
++  avg: number;
++  peak: number;
++  min: number;
++}
++
++export interface ScenarioOptions {
++  zoneId?: ZoneId;
++  /** Cooling: effectiveness target (0..1). Overheating: heat multiplier. Fire: intensity. */
++  severity?: number;
++  machine?: 'machine-a' | 'machine-b';
++}
++
++interface Footprint {
++  idx: Int32Array;
++  w: Float32Array;
++}
++
++function makeFootprint(cx: number, cy: number, radius: number): Footprint {
++  const sigma = radius / 1.5;
++  const reach = Math.ceil(radius * 1.8);
++  const idx: number[] = [];
++  const w: number[] = [];
++  for (let y = Math.floor(cy - reach); y <= Math.ceil(cy + reach); y++) {
++    for (let x = Math.floor(cx - reach); x <= Math.ceil(cx + reach); x++) {
++      if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
++      const d2 = (x - cx) ** 2 + (y - cy) ** 2;
++      const v = Math.exp(-d2 / (2 * sigma * sigma));
++      if (v > 0.02) {
++        idx.push(y * GRID_W + x);
++        w.push(v);
++      }
++    }
++  }
++  return { idx: Int32Array.from(idx), w: Float32Array.from(w) };
++}
++
++const approach = (cur: number, target: number, up: number, down: number) =>
++  cur < target ? Math.min(target, cur + up) : Math.max(target, cur - down);
++
++// The "normal operation" steady state is computed once and reused for every reset.
++let warmCache: { grid: Float32Array; baseline: number[] } | null = null;
++
++export class ThermalSimulation {
++  grid = new Float32Array(N);
++  private next = new Float32Array(N);
++  private heat = new Float32Array(N);
++  private coolCoef = new Float32Array(N);
++  private cellZone = new Int8Array(N);
++  private sourceFootprints: Footprint[];
++  private fireFootprints: Footprint[];
++
++  step = 0;
++
++  // --- operator-controlled conditions (current value ramps towards target) ---
++  private coolingEff = 1;
++  private coolingTarget = 1;
++  private machineMult: Record<string, number> = {};
++  private machineTarget: Record<string, number> = {};
++  private fireIntensity: number[] = ZONES.map(() => 0);
++  private fireTarget: number[] = ZONES.map(() => 0);
++  private suppressing: boolean[] = ZONES.map(() => false);
++  private ventilation: boolean[] = ZONES.map(() => false);
++  private lastPeaks: number[] = ZONES.map(() => AMBIENT_TEMP);
++
++  private baseline: number[] = ZONES.map(() => AMBIENT_TEMP);
++  private incident: { scenario: ScenarioId; zoneId: ZoneId | null; startedStep: number | null } = {
++    scenario: 'normal', zoneId: null, startedStep: null,
++  };
++
++  constructor() {
++    for (let y = 0; y < GRID_H; y++) {
++      for (let x = 0; x < GRID_W; x++) {
++        const i = y * GRID_W + x;
++        const z = zoneIndexOfCell(x, y);
++        this.cellZone[i] = z;
++        this.coolCoef[i] = z === COOLING_IDX ? K_COOL_LOCAL : K_COOL_HALO;
++      }
++    }
++    this.sourceFootprints = HEAT_SOURCES.map((s) => makeFootprint(s.x, s.y, s.radius));
++    this.fireFootprints = ZONES.map((z) =>
++      makeFootprint((z.x0 + z.x1 - 1) / 2, (z.y0 + z.y1 - 1) / 2, FIRE_RADIUS));
++    this.reset();
++  }
++
++  /** Back to normal operation, fully settled, step 0. */
++  reset(): void {
++    if (!warmCache) {
++      this.grid.fill(AMBIENT_TEMP);
++      this.clearControls();
++      for (let i = 0; i < WARMUP_STEPS; i++) this.advance();
++      warmCache = { grid: this.grid.slice(), baseline: this.lastPeaks.slice() };
++    }
++    this.grid.set(warmCache.grid);
++    this.baseline = warmCache.baseline.slice();
++    this.lastPeaks = warmCache.baseline.slice();
++    this.clearControls();
++    this.step = 0;
++    this.incident = { scenario: 'normal', zoneId: null, startedStep: null };
++  }
++
++  private clearControls(): void {
++    this.coolingEff = 1;
++    this.coolingTarget = 1;
++    for (const s of HEAT_SOURCES) {
++      this.machineMult[s.id] = 1;
++      this.machineTarget[s.id] = 1;
++    }
++    this.fireIntensity = ZONES.map(() => 0);
++    this.fireTarget = ZONES.map(() => 0);
++    this.suppressing = ZONES.map(() => false);
++    this.ventilation = ZONES.map(() => false);
++  }
++
++  getBaselinePeaks(): number[] {
++    return this.baseline.slice();
++  }
++
++  getCoolingEffectiveness(): number {
++    return this.coolingEff;
++  }
++
++  /** Apply an operator scenario. Scenarios are exclusive: each call starts from normal conditions. */
++  setScenario(scenario: ScenarioId, opts: ScenarioOptions = {}): void {
++    // Anything that was burning gets suppressed when the incident changes.
++    for (let z = 0; z < ZONES.length; z++) {
++      if (this.fireIntensity[z] > 0) this.suppressing[z] = true;
++      this.fireTarget[z] = 0;
++    }
++    this.coolingTarget = 1;
++    for (const s of HEAT_SOURCES) this.machineTarget[s.id] = 1;
++    this.ventilation = ZONES.map(() => false);
++
++    let zoneId: ZoneId | null = null;
++    if (scenario === 'cooling-failure') {
++      this.coolingTarget = opts.severity ?? DEFAULT_COOLING_FAILURE_EFFECTIVENESS;
++      zoneId = 'cooling';
++    } else if (scenario === 'machine-overheating') {
++      this.machineTarget[opts.machine ?? 'machine-a'] = opts.severity ?? DEFAULT_OVERHEAT_MULTIPLIER;
++      zoneId = 'production';
++    } else if (scenario === 'fire') {
++      zoneId = opts.zoneId ?? 'storage';
++      const z = zoneIndex(zoneId);
++      this.fireTarget[z] = opts.severity ?? DEFAULT_FIRE_INTENSITY;
++      this.suppressing[z] = false;
++    }
++    this.incident = {
++      scenario,
++      zoneId,
++      startedStep: scenario === 'normal' ? null : this.step,
++    };
++  }
++
++  // --- low-level controls used by the fault manager (targets ramp, they do not jump) ---
++  setCoolingTarget(v: number): void {
++    this.coolingTarget = v;
++  }
++
++  setMachineTarget(id: string, v: number): void {
++    this.machineTarget[id] = v;
++  }
++
++  setFire(zoneId: ZoneId, target: number, suppress: boolean): void {
++    const z = zoneIndex(zoneId);
++    if (target > 0) this.suppressing[z] = false;
++    else if (suppress && this.fireIntensity[z] > 0) this.suppressing[z] = true;
++    this.fireTarget[z] = target;
++  }
++
++  /**
++   * Apply an operator corrective action. These change the real simulation, exactly like the
++   * incident buttons do. Returns false if the action makes no sense right now.
++   */
++  applyAction(action: ActionId, zoneId?: ZoneId): boolean {
++    switch (action) {
++      case 'restart-cooling':
++        this.coolingTarget = 1;
++        return true;
++      case 'reduce-load':
++        for (const s of HEAT_SOURCES) {
++          if (s.kind === 'machine' && this.machineTarget[s.id] > REDUCED_LOAD_MULTIPLIER) {
++            this.machineTarget[s.id] = REDUCED_LOAD_MULTIPLIER;
++          }
++        }
++        return true;
++      case 'shutdown-machine':
++        // the machine that is running hottest
++        {
++          let hottest = 'machine-a';
++          for (const s of HEAT_SOURCES) {
++            if (s.kind === 'machine' && this.machineTarget[s.id] > this.machineTarget[hottest]) hottest = s.id;
++          }
++          this.machineTarget[hottest] = 0;
++        }
++        return true;
++      case 'sprinklers': {
++        const z = zoneIndex(zoneId ?? this.incident.zoneId ?? 'storage');
++        this.fireTarget[z] = 0;
++        this.suppressing[z] = true;
++        return true;
++      }
++      case 'ventilate': {
++        const z = zoneIndex(zoneId ?? this.incident.zoneId ?? 'storage');
++        this.ventilation[z] = true;
++        return true;
++      }
++    }
++    return false;
++  }
++
++  /** Readings an operator could see: what is wrong, not which button was pressed. */
++  getCauses(): { coolingEffectiveness: number; machineMultiplier: number; fireZones: ZoneId[] } {
++    let machineMultiplier = 1;
++    for (const s of HEAT_SOURCES) {
++      if (s.kind === 'machine') machineMultiplier = Math.max(machineMultiplier, this.machineMult[s.id]);
++    }
++    return {
++      coolingEffectiveness: this.coolingEff,
++      machineMultiplier,
++      fireZones: ZONES.filter((_, z) => this.fireIntensity[z] > 0.05).map((z) => z.id),
++    };
++  }
++
++  getIncident(): IncidentInfo {
++    const { scenario, zoneId, startedStep } = this.incident;
++    const where = zoneId ? getZone(zoneId).name : '';
++    const description: Record<ScenarioId, string> = {
++      normal: 'Normal operation',
++      'cooling-failure': 'Cooling failure: cooling effectiveness is being reduced',
++      'machine-overheating': 'Machine overheating: heat output of a production machine is rising',
++      fire: `Fire scenario in ${where}: rapid abnormal temperature rise`,
++    };
++    return {
++      scenario, zoneId, startedStep,
++      description: description[scenario],
++      coolingEffectiveness: Math.round(this.coolingEff * 100) / 100,
++    };
++  }
++
++  tick(): void {
++    this.advance();
++    this.step++;
++  }
++
++  private advance(): void {
++    // 1) ramp operator conditions toward their targets
++    this.coolingEff = approach(this.coolingEff, this.coolingTarget, 0.05, 0.05);
++    for (const s of HEAT_SOURCES) {
++      if (s.kind === 'machine') {
++        this.machineMult[s.id] = approach(this.machineMult[s.id], this.machineTarget[s.id], 0.06, 0.06);
++      }
++    }
++    for (let z = 0; z < ZONES.length; z++) {
++      this.fireIntensity[z] = approach(this.fireIntensity[z], this.fireTarget[z], 0.04, 0.12);
++      // Suppression ends once the zone is back near its normal peak.
++      if (this.suppressing[z] && this.fireIntensity[z] === 0 && this.lastPeaks[z] < this.baseline[z] + 4) {
++        this.suppressing[z] = false;
++      }
++    }
++
++    // 2) heat input map
++    const { grid, next, heat } = this;
++    heat.fill(0);
++    for (let s = 0; s < HEAT_SOURCES.length; s++) {
++      const src = HEAT_SOURCES[s];
++      const p = src.power * (src.kind === 'machine' ? this.machineMult[src.id] : 1);
++      const fp = this.sourceFootprints[s];
++      for (let k = 0; k < fp.idx.length; k++) heat[fp.idx[k]] += p * fp.w[k];
++    }
++    for (let z = 0; z < ZONES.length; z++) {
++      const f = this.fireIntensity[z];
++      if (f <= 0) continue;
++      const fp = this.fireFootprints[z];
++      for (let k = 0; k < fp.idx.length; k++) heat[fp.idx[k]] += FIRE_POWER * f * fp.w[k];
++    }
++
++    // 3) diffusion + heating + cooling to ambient
++    const eff = this.coolingEff;
++    for (let y = 0; y < GRID_H; y++) {
++      for (let x = 0; x < GRID_W; x++) {
++        const i = y * GRID_W + x;
++        const t = grid[i];
++        const l = grid[x > 0 ? i - 1 : i];
++        const r = grid[x < GRID_W - 1 ? i + 1 : i];
++        const u = grid[y > 0 ? i - GRID_W : i];
++        const d = grid[y < GRID_H - 1 ? i + GRID_W : i];
++        const avg = (l + r + u + d) / 4;
++        const z = this.cellZone[i];
++        const k = K_BASE + this.coolCoef[i] * eff + (this.suppressing[z] ? K_SUPPRESS : 0) + (this.ventilation[z] ? K_VENT : 0);
++        let nt = t + ALPHA * (avg - t) + heat[i] - k * (t - AMBIENT_TEMP);
++        if (nt > MAX_TEMP) nt = MAX_TEMP;
++        if (nt < AMBIENT_TEMP - 5) nt = AMBIENT_TEMP - 5;
++        next[i] = nt;
++      }
++    }
++    this.grid = next;
++    this.next = grid;
++
++    const stats = this.getZoneStats();
++    for (let z = 0; z < ZONES.length; z++) this.lastPeaks[z] = stats[z].peak;
++  }
++
++  getZoneStats(): ZoneStat[] {
++    const sums = ZONES.map(() => 0);
++    const counts = ZONES.map(() => 0);
++    const peaks = ZONES.map(() => -Infinity);
++    const mins = ZONES.map(() => Infinity);
++    for (let i = 0; i < N; i++) {
++      const z = this.cellZone[i];
++      const t = this.grid[i];
++      sums[z] += t;
++      counts[z]++;
++      if (t > peaks[z]) peaks[z] = t;
++      if (t < mins[z]) mins[z] = t;
++    }
++    return ZONES.map((z, k) => ({
++      id: z.id,
++      avg: sums[k] / counts[k],
++      peak: peaks[k],
++      min: mins[k],
++    }));
++  }
++}
+--- /dev/null
++++ b/client/src/local/forecasting/trendFallback.ts
+@@ -0,0 +1,27 @@
++import type { ZoneForecast } from '@shared/types';
++import { FORECAST_HORIZON, FORECAST_POINTS, ZONES } from '@shared/zones';
++
++/**
++ * Simple straight-line trend estimate. This is NOT a neural network and is always labelled
++ * as 'trend-fallback'. It is only used when the trained model is missing or failed to load.
++ */
++export function trendEstimate(history: number[], zoneIdx: number): ZoneForecast {
++  const zone = ZONES[zoneIdx];
++  const n = history.length;
++  const t = history[n - 1];
++  const slope = n > 8 ? (t - history[n - 9]) / 8 : 0;
++  const predicted = FORECAST_POINTS.map((s) => ({ step: s, temp: t + slope * s }));
++  const stepsToLimit = slope > 0.01 ? (zone.limit - t) / slope : null;
++  const projected = stepsToLimit !== null && stepsToLimit > 0 && stepsToLimit <= FORECAST_HORIZON
++    ? Math.ceil(stepsToLimit) : null;
++  return {
++    zoneId: zone.id,
++    source: 'trend-fallback',
++    riskScore: null,
++    warning: projected !== null && t < zone.limit,
++    horizon: FORECAST_HORIZON,
++    predicted,
++    projectedBreachInSteps: projected,
++    slope,
++  };
++}
+--- /dev/null
++++ b/client/src/local/forecasting/forecaster.ts
+@@ -0,0 +1,18 @@
++import type { ModelStatus, ZoneForecast, ZoneId } from '@shared/types';
++import { FORECAST_HORIZON, ZONES } from '@shared/zones';
++import { trendEstimate } from './trendFallback';
++
++/** Browser-only deployment: transparent trend estimates, not neural-network predictions. */
++export class Forecaster {
++  status: ModelStatus = {
++    state: 'missing',
++    message: 'Browser demo: trend-based estimates (not neural-network AI).',
++    horizon: FORECAST_HORIZON,
++  };
++  async load(): Promise<void> { /* No Node filesystem or server required. */ }
++  predict(histories: Record<ZoneId, number[]>): Record<ZoneId, ZoneForecast> {
++    const out = {} as Record<ZoneId, ZoneForecast>;
++    ZONES.forEach((z, i) => { out[z.id] = trendEstimate(histories[z.id], i); });
++    return out;
++  }
++}
+--- a/client/src/hooks/useSimulation.ts
++++ b/client/src/hooks/useSimulation.ts
+@@ -1,50 +1,63 @@
+ import { useCallback, useEffect, useRef, useState } from 'react';
+-import { io, type Socket } from 'socket.io-client';
+-import type {
+-  ActionId, ClientToServerEvents, ScenarioId, ServerToClientEvents, SimulationSnapshot, ZoneId,
+-} from '@shared/types';
++import type { ActionId, ScenarioId, SimulationSnapshot, ZoneId } from '@shared/types';
++import { ACTIONS } from '@shared/actions';
++import { ZONE_IDS } from '@shared/zones';
++import { SimulationService } from '../local/service';
+ 
+-type AppSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
+-
+-/** Connects to the simulation server. The client never invents temperatures: it only displays snapshots. */
++/** Each browser tab owns its own simulation. No network connection or persistent server. */
+ export function useSimulation() {
+   const [snapshot, setSnapshot] = useState<SimulationSnapshot | null>(null);
+   const [connected, setConnected] = useState(false);
+-  const socketRef = useRef<AppSocket | null>(null);
++  const serviceRef = useRef<SimulationService | null>(null);
++  const publish = useCallback(() => {
++    const service = serviceRef.current;
++    if (service) setSnapshot(service.snapshot());
++  }, []);
+ 
+   useEffect(() => {
+-    // VITE_SERVER_URL must be set to the public backend URL in Vercel.
+-    // Keep localhost as a fallback only for local development.
+-    const configuredUrl = (import.meta.env.VITE_SERVER_URL as string | undefined)?.trim();
+-    const url = configuredUrl?.replace(/\/$/, '') ||
+-      (import.meta.env.DEV ? 'http://localhost:4000' : window.location.origin);
+-    const socket: AppSocket = io(url, { reconnectionDelayMax: 2000 });
+-    socketRef.current = socket;
+-    socket.on('connect', () => setConnected(true));
+-    socket.on('disconnect', () => setConnected(false));
+-    socket.on('connect_error', () => setConnected(false));
+-    socket.on('snapshot', (s) => setSnapshot(s));
++    const service = new SimulationService();
++    serviceRef.current = service;
++    let cancelled = false;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const schedule = () => {
++      if (cancelled) return;
++      timer = setTimeout(() => {
++        if (!service.paused) { service.tick(); setSnapshot(service.snapshot()); }
++        schedule();
++      }, service.tickIntervalMs());
++    };
++    void service.init().then(() => {
++      if (cancelled) return;
++      setSnapshot(service.snapshot());
++      setConnected(true);
++      schedule();
++    }).catch((error: unknown) => {
++      console.error('Browser simulation failed to initialize', error);
++      if (!cancelled) setConnected(false);
++    });
+     return () => {
+-      socket.disconnect();
+-      socketRef.current = null;
++      cancelled = true;
++      if (timer) clearTimeout(timer);
++      serviceRef.current = null;
+     };
+   }, []);
+ 
+   const setScenario = useCallback((scenario: ScenarioId, zoneId?: ZoneId) => {
+-    socketRef.current?.emit('scenario:set', { scenario, zoneId });
+-  }, []);
+-  const reset = useCallback(() => {
+-    socketRef.current?.emit('simulation:reset');
+-  }, []);
++    if (!['normal', 'cooling-failure', 'machine-overheating', 'fire'].includes(scenario)) return;
++    serviceRef.current?.setScenario(scenario, zoneId && ZONE_IDS.includes(zoneId) ? zoneId : undefined);
++    publish();
++  }, [publish]);
++  const reset = useCallback(() => { serviceRef.current?.reset(); publish(); }, [publish]);
+   const control = useCallback((p: { paused?: boolean; speed?: number; stepOnce?: boolean }) => {
+-    socketRef.current?.emit('simulation:control', p);
+-  }, []);
++    serviceRef.current?.control(p); publish();
++  }, [publish]);
+   const applyAction = useCallback((actionId: ActionId, zoneId?: ZoneId, faultId?: string) => {
+-    socketRef.current?.emit('action:apply', { actionId, zoneId, faultId });
+-  }, []);
++    if (!ACTIONS.some(a => a.id === actionId)) return;
++    serviceRef.current?.applyAction(actionId, zoneId && ZONE_IDS.includes(zoneId) ? zoneId : undefined, faultId);
++    publish();
++  }, [publish]);
+   const acknowledge = useCallback((id: string) => {
+-    socketRef.current?.emit('alert:ack', { id });
+-  }, []);
+-
++    serviceRef.current?.acknowledge(id); publish();
++  }, [publish]);
+   return { snapshot, connected, setScenario, reset, acknowledge, control, applyAction };
+ }
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -26,10 +26,10 @@
+         <div className="text-3xl font-extrabold tracking-tight text-ink">Thermal Guard</div>
+         <div className="flex items-center gap-2 text-lg text-muted">
+           <WifiOff className="h-5 w-5 text-crit" />
+-          {connected ? 'Waiting for the first simulation step…' : 'Connecting to the simulation server on port 4000…'}
++          {connected ? 'Waiting for the first simulation step…' : 'Starting browser simulation…'}
+         </div>
+         <div className="text-base text-muted">
+-          Start everything with <code className="rounded-lg bg-white px-2 py-1 font-semibold text-accent">npm run dev</code>
++          Simulation runs locally in this browser tab.
+         </div>
+       </div>
+     );
+--- a/render.yaml
++++ /dev/null
+@@ -1,11 +0,0 @@
+-services:
+-  - type: web
+-    name: thermal-guard-api
+-    runtime: node
+-    plan: free
+-    buildCommand: npm install && npm run ensure-model -w server
+-    startCommand: npm run start -w server
+-    healthCheckPath: /api/health
+-    envVars:
+-      - key: NODE_ENV
+-        value: production
+--- a/client/.env.example
++++ /dev/null
+@@ -1,3 +0,0 @@
+-# In Vercel, add VITE_SERVER_URL as an environment variable and redeploy.
+-# Replace with the actual HTTPS URL of your Render web service (no trailing slash).
+-VITE_SERVER_URL=https://YOUR-RENDER-SERVICE.onrender.com
+--- a/DEPLOYMENT.md
++++ /dev/null
+@@ -1,17 +0,0 @@
+-# Thermal Guard deployment
+-
+-1. Push these changes to GitHub.
+-2. On Render, choose New > Blueprint and select this repository. Render reads render.yaml
+-   from the repository root. Allow the backend to build and start. The first build
+-   trains the forecasting model if absent and can take a few minutes.
+-3. Open https://YOUR-RENDER-SERVICE.onrender.com/api/health and verify JSON with ok: true.
+-4. In the Vercel frontend project, set VITE_SERVER_URL to the actual Render HTTPS
+-   service URL (no trailing slash) for Production, then redeploy the frontend.
+-   Vite embeds VITE_ variables at build time: a redeploy is essential.
+-5. For the frontend, keep the existing working Vercel build configuration; do not
+-   deploy the Socket.IO simulation backend as a Vercel Function.
+-6. Local development remains: npm install && npm run dev (localhost:5173 and :4000).
+-
+-Note: Render free services can spin down while idle, causing a slow initial connection.
+-The model file generated during the build is part of that deployment; changes to
+-runtime filesystem on free hosting should not be treated as persistent storage.
+--- /dev/null
++++ b/VERCEL_ONLY.md
+@@ -0,0 +1,14 @@
++# Vercel-only deployment
++The dashboard runs its own thermal simulation in each browser tab. No Express,
++Socket.IO, Render, or VITE_SERVER_URL is required for this build.
++The forecast is transparently labelled trend-based, not TensorFlow AI.
++State resets on page refresh; different visitors have independent simulations.
++
++On Vercel import only the `client` directory as a Vite project, or set
++Root Directory to `client`. Install Command: `npm install` (npm workspaces
++must resolve the root shared directory); if Vercel cannot access ../shared,
++deploy from repository root with Build Command `npm run build` and
++Output Directory `client/dist`. Framework Preset: Vite.
++Remove any old VITE_SERVER_URL environment variable and redeploy.
++Local full-stack server remains available via npm run dev, but frontend now
++uses browser simulation in both development and production.
