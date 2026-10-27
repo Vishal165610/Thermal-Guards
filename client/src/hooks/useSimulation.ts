@@ -13,9 +13,11 @@ export function useSimulation() {
   const socketRef = useRef<AppSocket | null>(null);
 
   useEffect(() => {
-    const url =
-      (import.meta.env.VITE_SERVER_URL as string | undefined) ??
-      `${window.location.protocol}//${window.location.hostname}:4000`;
+    // VITE_SERVER_URL must be set to the public backend URL in Vercel.
+    // Keep localhost as a fallback only for local development.
+    const configuredUrl = (import.meta.env.VITE_SERVER_URL as string | undefined)?.trim();
+    const url = configuredUrl?.replace(/\/$/, '') ||
+      (import.meta.env.DEV ? 'http://localhost:4000' : window.location.origin);
     const socket: AppSocket = io(url, { reconnectionDelayMax: 2000 });
     socketRef.current = socket;
     socket.on('connect', () => setConnected(true));

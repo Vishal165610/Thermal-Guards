@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: thermal-guard-api
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run ensure-model -w server
+    startCommand: npm run start -w server
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
