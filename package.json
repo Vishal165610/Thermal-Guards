@@ -1,0 +1,26 @@
+{
+  "name": "thermal-guard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "THERMAL GUARD \u2014 Predictive Industrial Digital Twin (AXON, AURIX Hackathon 2026)",
+  "type": "module",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c cyan,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "train": "npm run train -w server",
+    "rehearse": "npm run rehearse -w server",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
+    "build": "npm run build -w client",
+    "predev": "npm run ensure-model -w server",
+    "ensure-model": "npm run ensure-model -w server",
+    "rehearse:actions": "npm run rehearse:actions -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
