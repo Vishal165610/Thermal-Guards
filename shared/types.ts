@@ -57,6 +57,30 @@ export interface ZoneForecast {
   slope: number;
 }
 
+/** Held-out check on FRESH simulated incidents (never used for training). Not real-plant data. */
+export interface ModelEvaluation {
+  /** Plain-words description of what was tested. */
+  basis: string;
+  incidents: number;
+  /** Zone runs where the temperature limit really was crossed. */
+  breachRuns: number;
+  /** Zone runs where the limit was never crossed. */
+  safeRuns: number;
+  /** Breaches the AI warned about before they happened. */
+  caught: number;
+  /** caught / breachRuns, 0..1. */
+  detectionRate: number;
+  /** Safe runs in which the AI still raised a warning, 0..1. */
+  falseAlarmRate: number;
+  /** Median steps between the AI warning and the breach (caught breaches only). */
+  medianLeadAi: number | null;
+  /** Median steps between the ordinary WARNING level being reached and the breach (same breaches). */
+  medianLeadRule: number | null;
+  /** Share of caught breaches where the AI warned earlier than the WARNING level did. */
+  earlierThanRuleRate: number | null;
+  byScenario: { scenario: string; breaches: number; caught: number; medianLeadAi: number | null; medianLeadRule: number | null }[];
+}
+
 export interface ModelStatus {
   state: 'ready' | 'missing' | 'error';
   message: string;
@@ -64,6 +88,7 @@ export interface ModelStatus {
   trainedAt?: string;
   trainingSamples?: number;
   epochs?: number;
+  evaluation?: ModelEvaluation;
 }
 
 export interface Alert {

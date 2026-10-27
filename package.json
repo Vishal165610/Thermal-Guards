@@ -18,7 +18,8 @@
     "build": "npm run build -w client",
     "predev": "npm run ensure-model -w server",
     "ensure-model": "npm run ensure-model -w server",
-    "rehearse:actions": "npm run rehearse:actions -w server"
+    "rehearse:actions": "npm run rehearse:actions -w server",
+    "evaluate": "npm run evaluate -w server"
   },
   "devDependencies": {
     "concurrently": "^9.0.1"

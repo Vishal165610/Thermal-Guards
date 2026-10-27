@@ -125,7 +125,7 @@ export class OutcomeTracker {
     if (r.aiWarningStep !== null && r.firstActionStep !== null && r.reactionSteps !== null) {
       parts.push(
         r.reactionSteps >= 0
-          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} steps to react.`
+          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} ${r.reactionSteps === 1 ? 'step' : 'steps'} to react.`
           : `First action (step ${r.firstActionStep}) came before the forecast warning was confirmed (step ${r.aiWarningStep}).`,
       );
     }

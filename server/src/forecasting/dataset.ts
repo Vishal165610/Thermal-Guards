@@ -30,42 +30,60 @@ interface Options {
 
 const PAD = 40; // steady-state steps placed before each episode so history is always available
 
+
+export interface Episode {
+  kind: ScenarioId;
+  /** Peak temperature of every zone, step by step (PAD settled steps first). */
+  series: number[][];
+  /** Index in `series` where the incident started (null for the normal-day runs). */
+  onset: number | null;
+}
+
+/**
+ * Runs ONE randomised incident on the thermal simulation and records every zone's peak temperature.
+ * The order of random draws is fixed: do not reorder (it would change the training data).
+ */
+export function simulateEpisode(rand: () => number, sim: ThermalSimulation, stepsPerEpisode = 300): Episode {
+  const between = (a: number, b: number) => a + (b - a) * rand();
+  sim.reset();
+  const base = sim.getBaselinePeaks();
+  const series: number[][] = ZONES.map((_, z) => Array(PAD).fill(base[z]));
+
+  const r = rand();
+  const kind: ScenarioId =
+    r < 0.12 ? 'normal' : r < 0.42 ? 'cooling-failure' : r < 0.72 ? 'machine-overheating' : 'fire';
+  const onset = Math.floor(between(15, 70));
+  const restoreAt = rand() < 0.6 ? onset + Math.floor(between(25, 160)) : Infinity;
+  const fireZone: ZoneId = ZONE_IDS[Math.floor(rand() * ZONE_IDS.length)];
+  const severity =
+    kind === 'cooling-failure' ? between(0.0, 0.55)
+      : kind === 'machine-overheating' ? between(1.5, 3.4)
+        : between(0.35, 1.2);
+  const machine = rand() < 0.5 ? 'machine-a' : 'machine-b';
+
+  for (let s = 0; s < stepsPerEpisode; s++) {
+    if (s === onset && kind !== 'normal') sim.setScenario(kind, { zoneId: fireZone, severity, machine });
+    if (s === restoreAt) sim.setScenario('normal');
+    sim.tick();
+    const stats = sim.getZoneStats();
+    for (let z = 0; z < ZONES.length; z++) series[z].push(stats[z].peak);
+  }
+  return { kind, series, onset: kind === 'normal' ? null : PAD + onset };
+}
+
 /**
  * Generates training sequences by running the SAME thermal simulation with randomised incidents
  * (different scenario types, zones, severities, start times and recovery times).
  */
 export function generateDataset({ episodes, seed, stepsPerEpisode = 300 }: Options): Dataset {
   const rand = mulberry32(seed);
-  const between = (a: number, b: number) => a + (b - a) * rand();
   const sim = new ThermalSimulation();
   const x: number[][] = [];
   const y: number[][] = [];
   let positives = 0;
 
   for (let ep = 0; ep < episodes; ep++) {
-    sim.reset();
-    const base = sim.getBaselinePeaks();
-    const series: number[][] = ZONES.map((_, z) => Array(PAD).fill(base[z]));
-
-    const r = rand();
-    const kind: ScenarioId =
-      r < 0.12 ? 'normal' : r < 0.42 ? 'cooling-failure' : r < 0.72 ? 'machine-overheating' : 'fire';
-    const onset = Math.floor(between(15, 70));
-    const restoreAt = rand() < 0.6 ? onset + Math.floor(between(25, 160)) : Infinity;
-    const fireZone: ZoneId = ZONE_IDS[Math.floor(rand() * ZONE_IDS.length)];
-    const severity =
-      kind === 'cooling-failure' ? between(0.0, 0.55)
-        : kind === 'machine-overheating' ? between(1.5, 3.4)
-          : between(0.35, 1.2);
-    const machine = rand() < 0.5 ? 'machine-a' : 'machine-b';
-
-    for (let s = 0; s < stepsPerEpisode; s++) {
-      if (s === onset && kind !== 'normal') sim.setScenario(kind, { zoneId: fireZone, severity, machine });
-      if (s === restoreAt) sim.setScenario('normal');
-      sim.tick();
-      const stats = sim.getZoneStats();
-      for (let z = 0; z < ZONES.length; z++) series[z].push(stats[z].peak);
-    }
+    const { series } = simulateEpisode(rand, sim, stepsPerEpisode);
 
     // Turn the recorded series into (features -> future) examples.
     const total = series[0].length;

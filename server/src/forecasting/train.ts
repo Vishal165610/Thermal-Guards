@@ -6,6 +6,7 @@ import * as tf from '@tensorflow/tfjs';
 import { FEATURE_COUNT, FEATURE_VERSION, OUTPUT_COUNT } from '../../../shared/features';
 import { AI_WARN_RISK } from '../../../shared/zones';
 import { generateDataset, mulberry32 } from './dataset';
+import { attachEvaluation } from './evaluate';
 import { MODEL_FILE, saveModel } from './modelIO';
 
 const SEED = 20260;
@@ -106,6 +107,8 @@ async function main() {
     seed: SEED,
   });
   console.log(`\nSaved model to ${MODEL_FILE}`);
+  const ev = attachEvaluation();
+  console.log(`Fresh-incident check: caught ${ev.caught}/${ev.breachRuns} breaches early, median lead ${ev.medianLeadAi} steps (plain WARNING level: ${ev.medianLeadRule}).`);
   const last = hist.history.val_loss?.[hist.history.val_loss.length - 1];
   console.log(`Final validation loss: ${typeof last === 'number' ? last.toFixed(5) : last}`);
 }

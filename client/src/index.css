@@ -17,3 +17,6 @@ body {
 ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 6px; }
 .recharts-text { fill: #64748B; font-size: 13px; font-family: inherit; }
 button { font-family: inherit; }
+
+/* guided tour: leave a little air above the element it scrolls to */
+[id^='tour-'] { scroll-margin-top: 12px; }

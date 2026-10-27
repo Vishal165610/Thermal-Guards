@@ -12,7 +12,9 @@ small neural network that estimates the risk of a temperature-limit breach in th
 |---|---|---|
 | Temperatures (40 × 25 grid, 6 zones) | `server/src/simulation` | Fixed-timestep heat diffusion + heat sources + cooling. One source of truth. |
 | Rule alerts (NORMAL / WARNING / CRITICAL / RECOVERING) | `server/src/alerts` | Hysteresis, one alert per incident, acknowledge button. |
-| AI forecast | `server/src/forecasting` | TensorFlow.js dense network, trained on *generated* simulation data. |
+| AI forecast | `server/src/forecasting` | TensorFlow.js dense network, trained on *generated* simulation data. The browser build runs the same trained weights (`shared/neuralNet.ts`). |
+| AI evaluation | `server/src/forecasting/evaluate.ts` | `npm run evaluate`: 300 fresh simulated incidents (different seed than training), compared with the plain WARNING level. Shown on the Analytics page. |
+| Guided demo | `client/src/components/tour` | **Guided demo** button (top bar) or `?tour=1` in the URL: a ~3 minute auto-tour with big captions. |
 | Fallback estimate | `trendFallback.ts` | Straight-line trend. Always labelled **"Trend estimate (not AI)"**. |
 | Early-warning timeline | `server/src/alerts/earlyWarningTimeline.ts` | Computed from real events. Can say "no warning before breach". |
 | Dashboard + 3D | `client/` | Only displays server snapshots. No random frontend temperatures. |
@@ -41,9 +43,14 @@ npm run train
 * If the model file is missing or broken, the dashboard shows "AI MODEL UNAVAILABLE · TREND FALLBACK" and uses clearly labelled trend estimates.
 
 **What the network sees:** only the recent peak-temperature history of one zone, that zone's warning/limit values, and which zone it is. It is never told which incident is running.
-**What it outputs:** a breach-risk score (0–100 %) and estimated temperature change at +5 … +30 steps. The risk score is a model output, not a calibrated probability, and no accuracy figure is claimed in the UI.
+**What it outputs:** a breach-risk score (0–100 %) and estimated temperature change at +5 … +30 steps. The risk score is a model output, not a calibrated probability.
+**How it is checked:** `npm run evaluate` replays 300 fresh simulated incidents the network never saw in training and reports how many breaches it warned about first, the median warning time compared with the plain WARNING level, and warnings in runs that never breached. These numbers describe the simulator only, never a real plant. `npm run train` runs the same check at the end and stores the result inside the model file.
 
-## 3-minute demo script
+## Guided demo (auto-tour)
+Press **Guided demo** in the top bar (or open the page with `?tour=1`). It switches pages, starts the incident, pauses at the AI warning, presses the fix, and shows the result and the evaluation numbers, with big captions: *what you are looking at* and *say this*. About 3 minutes.
+**Space** pauses / resumes (the simulation pauses too), **← →** go back / forward, **Esc** stops, and you can click the progress bar to jump to a step. Full script: `docs/DEMO_TOUR.md`.
+
+## 3-minute demo script (manual)
 Use **Reset** before every run. Start incidents from the **Fix Center** page. The simulation starts at **0.5× speed (1 step = 1 second)**. Use the top-bar controls to **pause**, **step one tick at a time**, or change speed (0.25×, 0.5×, 1×, 2×). The banner at the top of the 3D view explains in plain English what is happening, and its 5-stage bar shows where you are in the story: Normal → Incident → Warning → Limit crossed → Recovery. Pause at each stage to explain it.
 
 | Time | Do | What to point out |

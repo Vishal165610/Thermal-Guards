@@ -1,4 +1,4 @@
-import { BarChart3, Bell, Boxes, Flame, LayoutDashboard, Pause, Play, RotateCcw, StepForward, Wifi, WifiOff, Wrench } from 'lucide-react';
+import { BarChart3, Bell, Boxes, Flame, LayoutDashboard, Pause, Play, PlayCircle, RotateCcw, StepForward, Wifi, WifiOff, Wrench } from 'lucide-react';
 import type { SimulationSnapshot } from '@shared/types';
 import { SPEEDS } from '@shared/zones';
 import type { PageId } from '../../hooks/usePage';
@@ -18,9 +18,11 @@ interface Props {
   connected: boolean;
   onReset: () => void;
   onControl: (p: { paused?: boolean; speed?: number; stepOnce?: boolean }) => void;
+  tourOn: boolean;
+  onTour: () => void;
 }
 
-export function TopNav({ page, onPage, snapshot, connected, onReset, onControl }: Props) {
+export function TopNav({ page, onPage, snapshot, connected, onReset, onControl, tourOn, onTour }: Props) {
   const paused = snapshot?.control.paused ?? false;
   const speed = snapshot?.control.speed ?? 1;
   const openIssues = snapshot ? snapshot.faults.filter((f) => f.state !== 'fixed').length : 0;
@@ -63,6 +65,15 @@ export function TopNav({ page, onPage, snapshot, connected, onReset, onControl }
       </nav>
 
       <div className="flex items-center gap-3">
+        <button
+          onClick={onTour}
+          disabled={!connected}
+          title="Run the guided 3-minute demo"
+          className={`flex h-11 items-center gap-2 rounded-xl px-4 text-[15px] font-bold transition disabled:opacity-40 ${tourOn ? 'bg-crit text-white hover:bg-red-700' : 'bg-accent text-white hover:bg-indigo-600'}`}
+        >
+          <PlayCircle className="h-5 w-5" />
+          {tourOn ? 'Stop demo' : 'Guided demo'}
+        </button>
         <span
           className={`flex items-center gap-2 rounded-full px-3.5 py-1.5 text-sm font-bold ${connected ? 'bg-ok/10 text-ok' : 'bg-crit/10 text-crit'}`}
         >

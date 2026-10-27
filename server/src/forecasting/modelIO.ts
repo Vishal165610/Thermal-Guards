@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ModelEvaluation } from '../../../shared/types';
 
 // The model is stored as ONE json file (topology + weights as base64), so it can be saved and
 // loaded with the plain-JavaScript TensorFlow.js build. No native add-ons are needed.
@@ -15,6 +16,7 @@ export interface ModelMeta {
   epochs: number;
   featureVersion: number;
   seed: number;
+  evaluation?: ModelEvaluation;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

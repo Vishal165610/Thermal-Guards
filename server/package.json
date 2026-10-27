@@ -10,7 +10,8 @@
     "rehearse": "tsx src/scripts/rehearse.ts",
     "typecheck": "tsc --noEmit",
     "ensure-model": "tsx src/forecasting/ensureModel.ts",
-    "rehearse:actions": "tsx src/scripts/rehearseActions.ts"
+    "rehearse:actions": "tsx src/scripts/rehearseActions.ts",
+    "evaluate": "tsx src/forecasting/evaluate.ts"
   },
   "dependencies": {
     "@tensorflow/tfjs": "^4.22.0",

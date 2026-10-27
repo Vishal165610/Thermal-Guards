@@ -1,0 +1,1515 @@
+diff --git a/README.md b/README.md
+index 9ec4b8c..a67c24f 100644
+--- a/README.md
++++ b/README.md
+@@ -12,7 +12,9 @@ small neural network that estimates the risk of a temperature-limit breach in th
+ |---|---|---|
+ | Temperatures (40 × 25 grid, 6 zones) | `server/src/simulation` | Fixed-timestep heat diffusion + heat sources + cooling. One source of truth. |
+ | Rule alerts (NORMAL / WARNING / CRITICAL / RECOVERING) | `server/src/alerts` | Hysteresis, one alert per incident, acknowledge button. |
+-| AI forecast | `server/src/forecasting` | TensorFlow.js dense network, trained on *generated* simulation data. |
++| AI forecast | `server/src/forecasting` | TensorFlow.js dense network, trained on *generated* simulation data. The browser build runs the same trained weights (`shared/neuralNet.ts`). |
++| AI evaluation | `server/src/forecasting/evaluate.ts` | `npm run evaluate`: 300 fresh simulated incidents (different seed than training), compared with the plain WARNING level. Shown on the Analytics page. |
++| Guided demo | `client/src/components/tour` | **Guided demo** button (top bar) or `?tour=1` in the URL: a ~3 minute auto-tour with big captions. |
+ | Fallback estimate | `trendFallback.ts` | Straight-line trend. Always labelled **"Trend estimate (not AI)"**. |
+ | Early-warning timeline | `server/src/alerts/earlyWarningTimeline.ts` | Computed from real events. Can say "no warning before breach". |
+ | Dashboard + 3D | `client/` | Only displays server snapshots. No random frontend temperatures. |
+@@ -41,9 +43,14 @@ npm run train
+ * If the model file is missing or broken, the dashboard shows "AI MODEL UNAVAILABLE · TREND FALLBACK" and uses clearly labelled trend estimates.
+ 
+ **What the network sees:** only the recent peak-temperature history of one zone, that zone's warning/limit values, and which zone it is. It is never told which incident is running.
+-**What it outputs:** a breach-risk score (0–100 %) and estimated temperature change at +5 … +30 steps. The risk score is a model output, not a calibrated probability, and no accuracy figure is claimed in the UI.
++**What it outputs:** a breach-risk score (0–100 %) and estimated temperature change at +5 … +30 steps. The risk score is a model output, not a calibrated probability.
++**How it is checked:** `npm run evaluate` replays 300 fresh simulated incidents the network never saw in training and reports how many breaches it warned about first, the median warning time compared with the plain WARNING level, and warnings in runs that never breached. These numbers describe the simulator only, never a real plant. `npm run train` runs the same check at the end and stores the result inside the model file.
+ 
+-## 3-minute demo script
++## Guided demo (auto-tour)
++Press **Guided demo** in the top bar (or open the page with `?tour=1`). It switches pages, starts the incident, pauses at the AI warning, presses the fix, and shows the result and the evaluation numbers, with big captions: *what you are looking at* and *say this*. About 3 minutes.
++**Space** pauses / resumes (the simulation pauses too), **← →** go back / forward, **Esc** stops, and you can click the progress bar to jump to a step. Full script: `docs/DEMO_TOUR.md`.
++
++## 3-minute demo script (manual)
+ Use **Reset** before every run. Start incidents from the **Fix Center** page. The simulation starts at **0.5× speed (1 step = 1 second)**. Use the top-bar controls to **pause**, **step one tick at a time**, or change speed (0.25×, 0.5×, 1×, 2×). The banner at the top of the 3D view explains in plain English what is happening, and its 5-stage bar shows where you are in the story: Normal → Incident → Warning → Limit crossed → Recovery. Pause at each stage to explain it.
+ 
+ | Time | Do | What to point out |
+diff --git a/VERCEL_ONLY.md b/VERCEL_ONLY.md
+index 52e7771..ef3a16c 100644
+--- a/VERCEL_ONLY.md
++++ b/VERCEL_ONLY.md
+@@ -1,7 +1,9 @@
+ # Vercel-only deployment
+ The dashboard runs its own thermal simulation in each browser tab. No Express,
+ Socket.IO, Render, or VITE_SERVER_URL is required for this build.
+-The forecast is transparently labelled trend-based, not TensorFlow AI.
++The forecast is the same trained neural network as the server: its weights (server/models/thermal-guard-model.json)
++are bundled into the page and run in plain JavaScript in the browser. If the weights ever fail to load, the app
++switches to clearly labelled trend estimates ("not AI").
+ State resets on page refresh; different visitors have independent simulations.
+ 
+ On Vercel import only the `client` directory as a Vite project, or set
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 5fad993..022f633 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -1,5 +1,5 @@
+ import { AlertTriangle, WifiOff } from 'lucide-react';
+-import { useCallback, useState } from 'react';
++import { useCallback, useEffect, useMemo, useState } from 'react';
+ import type { ZoneId } from '@shared/types';
+ import { useSimulation } from './hooks/useSimulation';
+ import { usePage } from './hooks/usePage';
+@@ -8,13 +8,27 @@ import { AlertsPage } from './pages/AlertsPage';
+ import { AnalyticsPage } from './pages/AnalyticsPage';
+ import { FixPage } from './pages/FixPage';
+ import { OverviewPage } from './pages/OverviewPage';
+-import { TwinPage } from './pages/TwinPage';
++import { TwinPage, type TwinView } from './pages/TwinPage';
++import { GuidedTour } from './components/tour/GuidedTour';
++import type { TourApi } from './components/tour/tourSteps';
+ 
+ export default function App() {
+   const { snapshot, connected, setScenario, reset, acknowledge, control, applyAction } = useSimulation();
+   const [page, go] = usePage();
+   const [selected, setSelected] = useState<ZoneId>('cooling');
++  const [twinView, setTwinView] = useState<TwinView>({ two: false, thermal: false });
++  const [tourOn, setTourOn] = useState(() => new URLSearchParams(window.location.search).has('tour'));
++  const [tourPad, setTourPad] = useState(0);
+   const onSelect = useCallback((id: ZoneId) => setSelected(id), []);
++  const exitTour = useCallback(() => { setTourOn(false); setTourPad(0); control({ paused: false }); }, [control]);
++  const tourApi = useMemo<TourApi>(() => ({
++    go, select: setSelected, view: setTwinView, reset,
++    scenario: setScenario,
++    action: (a, z) => applyAction(a, z),
++    control,
++  }), [go, reset, setScenario, applyAction, control]);
++  // keep the page usable if the tour is stopped while a step had it scrolled
++  useEffect(() => { if (!tourOn) setTourPad(0); }, [tourOn]);
+   const openZone = useCallback((id: ZoneId) => {
+     setSelected(id);
+     go('twin');
+@@ -39,16 +53,20 @@ export default function App() {
+ 
+   return (
+     <div className="flex h-full min-w-[1180px] flex-col bg-canvas text-ink">
+-      <TopNav page={page} onPage={go} snapshot={snapshot} connected={connected} onReset={reset} onControl={control} />
++      <TopNav page={page} onPage={go} snapshot={snapshot} connected={connected} onReset={reset} onControl={control}
++        tourOn={tourOn} onTour={() => (tourOn ? exitTour() : setTourOn(true))} />
+       {stale && (
+         <div className="flex items-center justify-center gap-2 border-b border-crit/30 bg-crit/10 py-2 text-[15px] font-bold text-crit">
+           <AlertTriangle className="h-5 w-5" />
+           Disconnected from the simulation server. These values are stale (last update at step {snapshot.step}), not live. Reconnecting…
+         </div>
+       )}
+-      <main className={`min-h-0 flex-1 overflow-y-auto transition ${stale ? 'opacity-50 grayscale' : ''}`}>
++      <main
++        className={`min-h-0 flex-1 overflow-y-auto transition ${stale ? 'opacity-50 grayscale' : ''}`}
++        style={tourOn ? { paddingBottom: tourPad } : undefined}
++      >
+         {page === 'overview' && <OverviewPage snapshot={snapshot} onOpenZone={openZone} onPage={go} />}
+-        {page === 'twin' && <TwinPage snapshot={snapshot} selected={selected} onSelect={onSelect} onPage={go} />}
++        {page === 'twin' && <TwinPage snapshot={snapshot} selected={selected} onSelect={onSelect} onPage={go} view={twinView} onView={setTwinView} />}
+         {page === 'fix' && (
+           <FixPage
+             snapshot={snapshot} disabled={stale} selected={selected}
+@@ -58,6 +76,7 @@ export default function App() {
+         {page === 'analytics' && <AnalyticsPage snapshot={snapshot} selected={selected} onSelect={onSelect} />}
+         {page === 'alerts' && <AlertsPage snapshot={snapshot} disabled={stale} onAck={acknowledge} />}
+       </main>
++      {tourOn && <GuidedTour snapshot={snapshot} api={tourApi} onExit={exitTour} onHeight={setTourPad} />}
+     </div>
+   );
+ }
+diff --git a/client/src/components/dashboard/EvaluationCard.tsx b/client/src/components/dashboard/EvaluationCard.tsx
+new file mode 100644
+index 0000000..a291c81
+--- /dev/null
++++ b/client/src/components/dashboard/EvaluationCard.tsx
+@@ -0,0 +1,99 @@
++import { FlaskConical } from 'lucide-react';
++import type { ModelEvaluation } from '@shared/types';
++import { Card } from '../ui/Card';
++
++const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
++const SCENARIO_NAMES: Record<string, string> = {
++  'cooling-failure': 'Cooling failure',
++  'machine-overheating': 'Machine overheating',
++  fire: 'Fire',
++};
++
++function Stat({ big, label, sub, tone }: { big: string; label: string; sub: string; tone: string }) {
++  return (
++    <div className="rounded-2xl border border-line bg-soft/60 px-5 py-4">
++      <div className="text-[13px] font-bold uppercase tracking-wider text-muted">{label}</div>
++      <div className="mt-1 text-4xl font-extrabold tabular-nums" style={{ color: tone }}>{big}</div>
++      <div className="mt-1 text-sm text-muted">{sub}</div>
++    </div>
++  );
++}
++
++function LeadBar({ label, value, max, color }: { label: string; value: number | null; max: number; color: string }) {
++  const w = value === null ? 0 : Math.max(2, (value / max) * 100);
++  return (
++    <div className="flex items-center gap-3">
++      <span className="w-[210px] shrink-0 text-[15px] font-semibold text-ink">{label}</span>
++      <div className="h-6 flex-1 rounded-full bg-soft">
++        <div className="h-6 rounded-full" style={{ width: `${w}%`, background: color }} />
++      </div>
++      <span className="w-[90px] shrink-0 text-right text-lg font-extrabold tabular-nums text-ink">{value === null ? '–' : `${value} steps`}</span>
++    </div>
++  );
++}
++
++export function EvaluationCard({ evaluation: e }: { evaluation: ModelEvaluation | undefined }) {
++  if (!e) {
++    return (
++      <Card title="How well does the AI warn? (simulated test)" subtitle="Held-out check on fresh simulated incidents">
++        <p className="text-base text-muted">No evaluation is stored with this model. Run <code>npm run evaluate</code> to create one.</p>
++      </Card>
++    );
++  }
++  const max = Math.max(e.medianLeadAi ?? 0, e.medianLeadRule ?? 0, 1);
++  return (
++    <Card
++      title="How well does the AI warn? (simulated test)"
++      subtitle={e.basis}
++      right={<span className="flex items-center gap-1.5 rounded-full bg-accent/10 px-3 py-1 text-sm font-bold text-accent"><FlaskConical className="h-4 w-4" />Held-out · simulated</span>}
++    >
++      <div className="grid grid-cols-3 gap-4">
++        <Stat
++          big={pct(e.detectionRate)} tone="#16A34A" label="Breaches warned early"
++          sub={`${e.caught} of ${e.breachRuns} real limit breaches had an AI warning first`}
++        />
++        <Stat
++          big={e.medianLeadAi === null ? '–' : `${e.medianLeadAi} steps`} tone="#4F46E5" label="Typical warning time"
++          sub={`median time between the AI warning and the breach${e.earlierThanRuleRate !== null ? ` · earlier than the WARNING level in ${pct(e.earlierThanRuleRate)} of cases` : ''}`}
++        />
++        <Stat
++          big={pct(e.falseAlarmRate)} tone="#D97706" label="Warnings in safe runs"
++          sub={`of ${e.safeRuns} zone runs that never crossed the limit`}
++        />
++      </div>
++
++      <div className="mt-6 space-y-3 rounded-2xl border border-line px-5 py-4">
++        <div className="text-[13px] font-bold uppercase tracking-wider text-muted">Warning time before the limit is crossed (median)</div>
++        <LeadBar label="Thermal Guard AI" value={e.medianLeadAi} max={max} color="#4F46E5" />
++        <LeadBar label="Plain WARNING level" value={e.medianLeadRule} max={max} color="#94A3B8" />
++      </div>
++
++      <table className="mt-5 w-full text-left text-[15px]">
++        <thead>
++          <tr className="text-[13px] uppercase tracking-wider text-muted">
++            <th className="py-2 font-bold">Incident type</th>
++            <th className="py-2 font-bold">Breaches</th>
++            <th className="py-2 font-bold">Warned first</th>
++            <th className="py-2 font-bold">AI lead</th>
++            <th className="py-2 font-bold">WARNING-level lead</th>
++          </tr>
++        </thead>
++        <tbody>
++          {e.byScenario.map((s) => (
++            <tr key={s.scenario} className="border-t border-line">
++              <td className="py-2 font-semibold text-ink">{SCENARIO_NAMES[s.scenario] ?? s.scenario}</td>
++              <td className="py-2 tabular-nums">{s.breaches}</td>
++              <td className="py-2 tabular-nums">{s.caught}</td>
++              <td className="py-2 font-bold tabular-nums text-accent">{s.medianLeadAi ?? '–'} steps</td>
++              <td className="py-2 tabular-nums text-muted">{s.medianLeadRule ?? '–'} steps</td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++      <p className="mt-4 text-sm text-muted">
++        Measured on simulated incidents from the same simulator, not on a real plant. For slow cooling failures the plain WARNING level can
++        come as early as the AI, so the AI gains most on fast problems (machines, fire). Rerun with <code>npm run evaluate</code>.
++      </p>
++    </Card>
++  );
++}
+diff --git a/client/src/components/dashboard/TopNav.tsx b/client/src/components/dashboard/TopNav.tsx
+index d37862e..76bf057 100644
+--- a/client/src/components/dashboard/TopNav.tsx
++++ b/client/src/components/dashboard/TopNav.tsx
+@@ -1,4 +1,4 @@
+-import { BarChart3, Bell, Boxes, Flame, LayoutDashboard, Pause, Play, RotateCcw, StepForward, Wifi, WifiOff, Wrench } from 'lucide-react';
++import { BarChart3, Bell, Boxes, Flame, LayoutDashboard, Pause, Play, PlayCircle, RotateCcw, StepForward, Wifi, WifiOff, Wrench } from 'lucide-react';
+ import type { SimulationSnapshot } from '@shared/types';
+ import { SPEEDS } from '@shared/zones';
+ import type { PageId } from '../../hooks/usePage';
+@@ -18,9 +18,11 @@ interface Props {
+   connected: boolean;
+   onReset: () => void;
+   onControl: (p: { paused?: boolean; speed?: number; stepOnce?: boolean }) => void;
++  tourOn: boolean;
++  onTour: () => void;
+ }
+ 
+-export function TopNav({ page, onPage, snapshot, connected, onReset, onControl }: Props) {
++export function TopNav({ page, onPage, snapshot, connected, onReset, onControl, tourOn, onTour }: Props) {
+   const paused = snapshot?.control.paused ?? false;
+   const speed = snapshot?.control.speed ?? 1;
+   const openIssues = snapshot ? snapshot.faults.filter((f) => f.state !== 'fixed').length : 0;
+@@ -63,6 +65,15 @@ export function TopNav({ page, onPage, snapshot, connected, onReset, onControl }
+       </nav>
+ 
+       <div className="flex items-center gap-3">
++        <button
++          onClick={onTour}
++          disabled={!connected}
++          title="Run the guided 3-minute demo"
++          className={`flex h-11 items-center gap-2 rounded-xl px-4 text-[15px] font-bold transition disabled:opacity-40 ${tourOn ? 'bg-crit text-white hover:bg-red-700' : 'bg-accent text-white hover:bg-indigo-600'}`}
++        >
++          <PlayCircle className="h-5 w-5" />
++          {tourOn ? 'Stop demo' : 'Guided demo'}
++        </button>
+         <span
+           className={`flex items-center gap-2 rounded-full px-3.5 py-1.5 text-sm font-bold ${connected ? 'bg-ok/10 text-ok' : 'bg-crit/10 text-crit'}`}
+         >
+diff --git a/client/src/components/tour/GuidedTour.tsx b/client/src/components/tour/GuidedTour.tsx
+new file mode 100644
+index 0000000..8244cce
+--- /dev/null
++++ b/client/src/components/tour/GuidedTour.tsx
+@@ -0,0 +1,221 @@
++import { ChevronDown, ChevronUp, Pause, Play, RotateCcw, SkipBack, SkipForward, X } from 'lucide-react';
++import { useCallback, useEffect, useRef, useState } from 'react';
++import type { SimulationSnapshot } from '@shared/types';
++import { TOUR_STEPS, TOTAL_STEPS, simUsed, type TourApi } from './tourSteps';
++
++interface Props {
++  snapshot: SimulationSnapshot;
++  api: TourApi;
++  onExit: () => void;
++  /** Height of the panel in pixels, so the page can leave room for it. */
++  onHeight: (px: number) => void;
++}
++
++const TICK = 100;
++const mmss = (ms: number) => {
++  const s = Math.floor(ms / 1000);
++  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
++};
++
++export function GuidedTour({ snapshot, api, onExit, onHeight }: Props) {
++  const [idx, setIdx] = useState(0);
++  const [paused, setPaused] = useState(false);
++  const [done, setDone] = useState(false);
++  const [compact, setCompact] = useState(false);
++  const [runId, setRunId] = useState(0); // bumps on "Run again" so step 1 is entered again
++  const [elapsed, setElapsed] = useState(0); // ms in the current step
++  const [total, setTotal] = useState(0); // ms in the whole tour
++  const panelRef = useRef<HTMLDivElement>(null);
++
++  // latest values for the timer and handlers (no stale closures)
++  const snapRef = useRef(snapshot); snapRef.current = snapshot;
++  const apiRef = useRef(api); apiRef.current = api;
++  const pausedRef = useRef(paused); pausedRef.current = paused;
++  const idxRef = useRef(idx); idxRef.current = idx;
++  const elapsedRef = useRef(0);
++
++  const step = TOUR_STEPS[Math.min(idx, TOTAL_STEPS - 1)];
++
++  // ---- enter a step: switch page, set the scene, run its actions ----
++  useEffect(() => {
++    if (done) return;
++    const st = TOUR_STEPS[idx];
++    const a = apiRef.current;
++    const s = snapRef.current;
++    if (st.fresh && simUsed(s)) a.reset();
++    a.go(st.page);
++    st.enter?.(a, snapRef.current);
++    elapsedRef.current = 0;
++    setElapsed(0);
++    const t = window.setTimeout(() => {
++      const main = document.querySelector('main');
++      const el = st.focus ? document.querySelector(st.focus) : null;
++      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
++      else main?.scrollTo({ top: 0, behavior: 'smooth' });
++    }, 350);
++    return () => window.clearTimeout(t);
++  }, [idx, done, runId]);
++
++  const goTo = useCallback((i: number) => {
++    if (i >= TOTAL_STEPS) { setDone(true); return; }
++    setDone(false);
++    setIdx(Math.max(0, i));
++  }, []);
++
++  const setPause = useCallback((p: boolean) => {
++    setPaused(p);
++    // pausing the tour pauses the simulation; resuming gives the step the playback it wants
++    const st = TOUR_STEPS[idxRef.current];
++    apiRef.current.control({ paused: p ? true : !!st.simPaused });
++  }, []);
++
++  // ---- the clock ----
++  useEffect(() => {
++    if (done) return;
++    const id = window.setInterval(() => {
++      if (pausedRef.current) return;
++      elapsedRef.current += TICK;
++      setElapsed(elapsedRef.current);
++      setTotal((t) => t + TICK);
++      const st = TOUR_STEPS[idxRef.current];
++      const e = elapsedRef.current;
++      const minOk = e >= st.sec * 1000;
++      const cond = st.until ? st.until(snapRef.current) : true;
++      const capped = st.until && st.maxSec !== undefined && e >= st.maxSec * 1000;
++      if (minOk && (cond || capped)) {
++        if (idxRef.current + 1 >= TOTAL_STEPS) setDone(true);
++        else setIdx(idxRef.current + 1);
++      }
++    }, TICK);
++    return () => window.clearInterval(id);
++  }, [done]);
++
++  // ---- keyboard: space, arrows, escape ----
++  useEffect(() => {
++    const on = (ev: KeyboardEvent) => {
++      if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLTextAreaElement) return;
++      if (ev.code === 'Space') { ev.preventDefault(); setPause(!pausedRef.current); }
++      else if (ev.code === 'ArrowRight') goTo(idxRef.current + 1);
++      else if (ev.code === 'ArrowLeft') goTo(idxRef.current - 1);
++      else if (ev.code === 'Escape') onExit();
++    };
++    window.addEventListener('keydown', on);
++    return () => window.removeEventListener('keydown', on);
++  }, [goTo, onExit, setPause]);
++
++  // ---- tell the page how much room the panel needs ----
++  useEffect(() => {
++    const el = panelRef.current;
++    if (!el) return;
++    const ro = new ResizeObserver(() => onHeight(el.offsetHeight));
++    ro.observe(el);
++    onHeight(el.offsetHeight);
++    return () => { ro.disconnect(); onHeight(0); };
++  }, [onHeight]);
++
++  const restart = () => {
++    setPaused(false);
++    setDone(false);
++    setTotal(0);
++    setIdx(0);
++    setRunId((r) => r + 1);
++  };
++
++  // ---------- finished ----------
++  if (done) {
++    return (
++      <div ref={panelRef} className="fixed inset-x-0 bottom-0 z-50 border-t-4 border-accent bg-[#0B1220] px-10 py-7 text-white shadow-[0_-12px_40px_rgba(0,0,0,0.35)]">
++        <div className="flex items-center justify-between gap-6">
++          <div>
++            <div className="text-sm font-bold uppercase tracking-[0.2em] text-indigo-300">Demo complete · {mmss(total)}</div>
++            <div className="mt-1 text-[38px] font-extrabold leading-tight">See the heat. Predict the risk. Act before failure.</div>
++            <div className="mt-1 text-2xl text-slate-300">Questions? The dashboard is live: click anything, or press Reset in the top bar.</div>
++          </div>
++          <div className="flex gap-3">
++            <button onClick={restart} className="flex items-center gap-2 rounded-xl bg-white/10 px-6 py-4 text-xl font-bold hover:bg-white/20"><RotateCcw className="h-6 w-6" />Run again</button>
++            <button onClick={onExit} className="flex items-center gap-2 rounded-xl bg-accent px-6 py-4 text-xl font-bold hover:bg-indigo-500"><X className="h-6 w-6" />Close</button>
++          </div>
++        </div>
++      </div>
++    );
++  }
++
++  const waiting = !!step.until && elapsed >= step.sec * 1000 && !step.until(snapshot);
++  const stepFrac = Math.min(1, elapsed / ((step.until ? Math.max(step.sec, 1) : step.sec) * 1000));
++  const btn = 'flex h-12 items-center gap-2 rounded-xl px-5 text-lg font-bold transition';
++
++  return (
++    <div
++      ref={panelRef}
++      className="fixed inset-x-0 bottom-0 z-50 bg-[#0B1220] text-white shadow-[0_-12px_40px_rgba(0,0,0,0.35)]"
++      onKeyUp={(e) => { if (e.code === 'Space') e.preventDefault(); }}
++    >
++      {/* progress: one segment per step, click to jump */}
++      <div className="flex h-2.5 gap-[3px] bg-[#0B1220]">
++        {TOUR_STEPS.map((s, i) => (
++          <button
++            key={s.id}
++            aria-label={`Go to step ${i + 1}: ${s.title}`}
++            title={`${i + 1}. ${s.title}`}
++            onClick={() => goTo(i)}
++            className="relative h-full flex-1 bg-white/15"
++            style={{ flexGrow: s.sec + (s.until ? 8 : 0) }}
++          >
++            <span
++              className="absolute inset-y-0 left-0 bg-indigo-400"
++              style={{ width: i < idx ? '100%' : i === idx ? `${stepFrac * 100}%` : '0%' }}
++            />
++          </button>
++        ))}
++      </div>
++
++      <div className="px-10 pb-3 pt-3">
++        {/* top row: where we are + controls */}
++        <div className="flex items-center justify-between gap-4">
++          <div className="flex items-center gap-3 text-base font-bold uppercase tracking-[0.15em]">
++            <span className="rounded-full bg-indigo-500 px-4 py-1.5 text-white">Step {idx + 1} / {TOTAL_STEPS}</span>
++            <span className="text-indigo-300">{step.label}</span>
++            <span className="text-slate-400">· demo time {mmss(total)}</span>
++            {paused && <span className="animate-pulseRing rounded-full bg-amber-500 px-4 py-1.5 text-white">Paused</span>}
++            {!paused && waiting && <span className="animate-pulseRing text-amber-300">{step.waitingFor}</span>}
++          </div>
++          <div className="flex items-center gap-2">
++            <button className={`${btn} bg-white/10 hover:bg-white/20`} onClick={() => goTo(idx - 1)} disabled={idx === 0} title="Previous (←)"><SkipBack className="h-6 w-6" />Back</button>
++            <button
++              className={`${btn} ${paused ? 'bg-amber-500 hover:bg-amber-400' : 'bg-indigo-500 hover:bg-indigo-400'} min-w-[170px] justify-center text-xl`}
++              onClick={() => setPause(!paused)} title="Pause / resume (Space)"
++            >
++              {paused ? <Play className="h-7 w-7" /> : <Pause className="h-7 w-7" />}
++              {paused ? 'Resume' : 'Pause'}
++            </button>
++            <button className={`${btn} bg-white/10 hover:bg-white/20`} onClick={() => goTo(idx + 1)} title="Next (→)">Next<SkipForward className="h-6 w-6" /></button>
++            <button className={`${btn} bg-white/10 hover:bg-white/20 !px-4`} onClick={() => setCompact((c) => !c)} title={compact ? 'Show script' : 'Hide script'}>
++              {compact ? <ChevronUp className="h-6 w-6" /> : <ChevronDown className="h-6 w-6" />}
++            </button>
++            <button className={`${btn} bg-white/10 hover:bg-red-500/80 !px-4`} onClick={onExit} title="Stop the demo (Esc)"><X className="h-6 w-6" /></button>
++          </div>
++        </div>
++
++        <h2 className="mt-2 text-[34px] font-extrabold leading-tight tracking-tight">{step.title}</h2>
++
++        {!compact && (
++          <div className="mt-2 grid grid-cols-[1fr_1fr] gap-6">
++            <div>
++              <div className="mb-1 text-sm font-bold uppercase tracking-[0.2em] text-slate-400">What you are looking at</div>
++              <ul className="space-y-1.5 text-[22px] font-semibold leading-snug text-slate-100">
++                {step.see(snapshot).map((l, i) => (
++                  <li key={i} className="flex gap-3"><span className="mt-[10px] h-2.5 w-2.5 shrink-0 rounded-full bg-indigo-400" /><span>{l}</span></li>
++                ))}
++              </ul>
++            </div>
++            <div className="rounded-2xl border border-indigo-400/40 bg-indigo-500/15 px-5 py-3">
++              <div className="mb-1 text-sm font-bold uppercase tracking-[0.2em] text-indigo-300">Say this</div>
++              <p className="text-[24px] font-bold leading-snug text-white">{step.say(snapshot)}</p>
++            </div>
++          </div>
++        )}
++        <div className="mt-2 text-xs text-slate-500">Space = pause / resume · ← → = back / next · Esc = stop · click the bar on top to jump</div>
++      </div>
++    </div>
++  );
++}
+diff --git a/client/src/components/tour/tourSteps.ts b/client/src/components/tour/tourSteps.ts
+new file mode 100644
+index 0000000..62bddc3
+--- /dev/null
++++ b/client/src/components/tour/tourSteps.ts
+@@ -0,0 +1,261 @@
++import type { ActionId, ScenarioId, SimulationSnapshot, TimelineEntry, ZoneForecast, ZoneId, ZoneState } from '@shared/types';
++import type { PageId } from '../../hooks/usePage';
++import type { TwinView } from '../../pages/TwinPage';
++
++/** Everything the tour is allowed to do to the app. */
++export interface TourApi {
++  go: (p: PageId) => void;
++  select: (z: ZoneId) => void;
++  view: (v: TwinView) => void;
++  reset: () => void;
++  scenario: (s: ScenarioId, z?: ZoneId) => void;
++  action: (a: ActionId, z?: ZoneId) => void;
++  control: (p: { paused?: boolean; speed?: number }) => void;
++}
++
++type Snap = SimulationSnapshot;
++
++export interface TourStep {
++  id: string;
++  page: PageId;
++  /** Short page name for the chip. */
++  label: string;
++  title: string;
++  /** What the audience is looking at (can show live numbers). */
++  see: (s: Snap) => string[];
++  /** What the presenter says. */
++  say: (s: Snap) => string;
++  /** Seconds the step stays (minimum, when `until` is set). */
++  sec: number;
++  /** Step ends once this is true (and `sec` has passed), or after `maxSec`. */
++  until?: (s: Snap) => boolean;
++  maxSec?: number;
++  /** Shown while waiting for `until`. */
++  waitingFor?: string;
++  /** Reset the simulation first if an earlier run left it in a used state. */
++  fresh?: boolean;
++  /** The simulation is paused during this step (so the presenter can talk). */
++  simPaused?: boolean;
++  enter?: (api: TourApi, s: Snap) => void;
++  /** CSS selector scrolled into view after the page changes. */
++  focus?: string;
++}
++
++// ---------- small helpers (all read live values, nothing is made up) ----------
++const zone = (s: Snap, id: ZoneId): ZoneState => s.zones.find((z) => z.id === id)!;
++const fc = (s: Snap, id: ZoneId): ZoneForecast => s.forecasts.find((f) => f.zoneId === id)!;
++const entry = (s: Snap, id: ZoneId): TimelineEntry | undefined => s.timeline.find((t) => t.zoneId === id);
++export const aiWarned = (s: Snap) => entry(s, 'cooling')?.aiWarningStep != null;
++export const simUsed = (s: Snap) =>
++  s.incident.scenario !== 'normal' || s.timeline.length > 0 || s.actions.length > 0 || s.alerts.length > 0 || s.outcome.status !== 'idle';
++const risk = (s: Snap) => {
++  const f = fc(s, 'cooling');
++  return f.riskScore === null ? null : Math.round(f.riskScore * 100);
++};
++const deg = (v: number) => `${v.toFixed(1)}°C`;
++const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
++
++export const TOUR_STEPS: TourStep[] = [
++  {
++    id: 'welcome', page: 'overview', label: 'Overview', fresh: true, sec: 12,
++    title: 'THERMAL GUARD',
++    enter: (api) => { api.reset(); api.control({ paused: false, speed: 0.5 }); },
++    see: () => [
++      'A live digital twin of a factory.',
++      'All six zones are GREEN: everything is normal.',
++      'Every number is SIMULATED. There are no real sensors.',
++    ],
++    say: () =>
++      'Factories usually learn about overheating after the alarm goes off. Thermal Guard watches the heat build, warns the operator BEFORE the limit is crossed, and shows what to do about it. Everything you will see is simulated data.',
++  },
++  {
++    id: 'zones', page: 'overview', label: 'Overview', fresh: true, sec: 14,
++    title: 'Six zones. One big meter each.',
++    see: () => [
++      'Boiler · Production · Cooling · Storage · Electrical · Packaging.',
++      'Each meter shows the HOTTEST point of its zone.',
++      'GREEN = normal   AMBER = warning   RED = limit crossed.',
++    ],
++    say: (s) =>
++      `Every zone has a warning level and a hard limit. Look at the Cooling Unit: its limit is ${zone(s, 'cooling').limit}°C and right now it is at ${deg(zone(s, 'cooling').peakTemp)}. Healthy.`,
++  },
++  {
++    id: 'twin', page: 'twin', label: 'Live Twin', fresh: true, sec: 12,
++    title: 'The factory as a 3D digital twin',
++    enter: (api) => { api.select('cooling'); api.view({ two: false, thermal: false }); },
++    see: () => [
++      'Click any machine: its zone is selected.',
++      'The two fans on the Cooling Unit are spinning.',
++      'The card at the bottom left shows the live temperature.',
++    ],
++    say: () =>
++      'This is the digital twin. It is driven by a 40-by-25 grid of temperatures that the simulator updates every single step. The browser never invents a number.',
++  },
++  {
++    id: 'heatmap', page: 'twin', label: 'Live Twin', fresh: true, sec: 12,
++    title: 'Machines and heat map, side by side',
++    enter: (api) => api.view({ two: true, thermal: false }),
++    see: () => [
++      'LEFT: the machines, as the operator sees them.',
++      'RIGHT: the heat map, showing where the heat really is.',
++      'Heat spreads, so a problem in one zone warms its neighbours.',
++    ],
++    say: () =>
++      'On the left you see the equipment. On the right you see the heat. Point at a machine and its temperature at the same moment.',
++  },
++  {
++    id: 'break', page: 'fix', label: 'Fix Center', sec: 9, focus: '#tour-fix-list',
++    title: 'Now we BREAK the cooling unit',
++    enter: (api, s) => {
++      if (s.incident.scenario === 'normal') api.scenario('cooling-failure');
++      api.control({ paused: false, speed: 1 });
++    },
++    see: (s) => [
++      'The tour just pressed COOLING FAILURE (a test button).',
++      'Cooling power drops and the fans slow down.',
++      `Open issue in the list: ${s.faults.find((f) => f.zoneId === 'cooling')?.title ?? 'Cooling pump failing'}.`,
++    ],
++    say: () =>
++      'We simulate a failing cooling pump. Notice that nothing has crossed any limit yet: the zone is still green. This is exactly the moment where a normal alarm says nothing.',
++  },
++  {
++    id: 'watch', page: 'twin', label: 'Live Twin', sec: 7, until: aiWarned, maxSec: 45,
++    waitingFor: 'Waiting for the AI warning…',
++    title: 'Watch the heat build',
++    enter: (api, s) => {
++      if (s.incident.scenario === 'normal') api.scenario('cooling-failure');
++      api.select('cooling');
++      api.view({ two: false, thermal: true });
++      api.control({ paused: false, speed: 1 });
++    },
++    see: (s) => {
++      const z = zone(s, 'cooling');
++      const r = risk(s);
++      return [
++        `Cooling Unit: ${deg(z.peakTemp)}   ·   limit ${z.limit}°C`,
++        `Heating about ${Math.max(0, z.trend).toFixed(2)}°C every step.`,
++        r === null ? 'AI estimate unavailable.' : `AI breach risk right now: ${r}%`,
++      ];
++    },
++    say: () =>
++      'Look at the heat map: the cooling zone is getting warmer, but the limit is still far away. The AI is reading the shape of the temperature curve, not just the number.',
++  },
++  {
++    id: 'warning', simPaused: true, page: 'overview', label: 'Overview', sec: 18,
++    title: 'AI WARNING: before anything breaks',
++    enter: (api) => { api.select('cooling'); api.control({ paused: true }); },
++    see: (s) => {
++      const z = zone(s, 'cooling');
++      const f = fc(s, 'cooling');
++      const e = entry(s, 'cooling');
++      return [
++        `Cooling Unit is ${deg(z.peakTemp)}. The limit is ${z.limit}°C and has NOT been crossed.`,
++        e?.aiWarningStep != null
++          ? `AI confirmed the warning at step ${e.aiWarningStep}: breach risk ${risk(s)}%${f.projectedBreachInSteps !== null ? `, limit expected in about ${f.projectedBreachInSteps} steps` : ''}.`
++          : 'The AI has not confirmed a warning yet.',
++        'The zone turned AMBER and an AI item appeared in the alert feed.',
++      ];
++    },
++    say: () =>
++      'This is our main feature. The red limit alarm is still silent, but the neural network has seen the curve bending upward and warns us now. That is time to act. We paused the simulation so we can talk.',
++  },
++  {
++    id: 'todo', simPaused: true, page: 'fix', label: 'Fix Center', sec: 12, focus: '#tour-fix-list',
++    title: 'WHAT TO DO, and what it costs',
++    enter: (api) => { api.select('cooling'); api.control({ paused: true }); },
++    see: (s) => {
++      const rec = s.recommendations.find((r) => r.zoneId === 'cooling');
++      return [
++        `Suggested now: ${rec ? rec.actionId.replace(/-/g, ' ').toUpperCase() : 'RESTART COOLING'}.`,
++        'Every action shows its cost: nothing is free.',
++        'These suggestions are plain rules, not AI. The operator decides.',
++      ];
++    },
++    say: () =>
++      'The AI tells us WHEN. Simple rules tell us WHAT. Every action lists what it costs, because every fix is a trade-off. We choose the online fix: restart the cooling remotely.',
++  },
++  {
++    id: 'act', page: 'twin', label: 'Live Twin', sec: 9, maxSec: 28,
++    // wait until the zone is back to NORMAL and the timeline entry is closed, so the result page is complete
++    until: (s) => zone(s, 'cooling').status === 'NORMAL' && entry(s, 'cooling')?.resolvedStep != null,
++    waitingFor: 'Cooling down…',
++    title: 'The operator presses RESTART COOLING',
++    enter: (api) => {
++      api.select('cooling');
++      api.view({ two: false, thermal: true });
++      api.action('restart-cooling', 'cooling');
++      api.control({ paused: false, speed: 2 });
++    },
++    see: (s) => {
++      const z = zone(s, 'cooling');
++      return [
++        `Cooling Unit: ${deg(z.peakTemp)} and ${z.trend < -0.02 ? 'FALLING' : z.trend > 0.02 ? 'still rising' : 'holding'}.   Status: ${z.status}`,
++        'The fans speed up again.',
++        'The pump is still damaged: cooling runs at about 70% until a technician repairs it.',
++      ];
++    },
++    say: () =>
++      'Watch the heat map cool down. The online fix contains the problem right now. The root cause is not repaired, so the Fix Center keeps that issue open until a technician fixes the pump on site.',
++  },
++  {
++    id: 'result', simPaused: true, page: 'analytics', label: 'Analytics', sec: 18, focus: '#tour-early-warning',
++    title: 'RESULT: the breach was avoided',
++    enter: (api) => { api.select('cooling'); api.control({ paused: true }); },
++    see: (s) => {
++      const e = entry(s, 'cooling');
++      return [
++        s.outcome.headline,
++        s.outcome.detail,
++        e ? e.summary : 'No timeline entry yet.',
++      ];
++    },
++    say: () =>
++      'Same incident, different outcome, because we acted on the early warning. Without any action the temperature keeps climbing past the limit. These lines are not scripted: they are built from the real events of this run.',
++  },
++  {
++    id: 'numbers', simPaused: true, page: 'analytics', label: 'Analytics', sec: 22, focus: '#tour-evaluation',
++    title: 'How good is the AI? (simulated test)',
++    enter: (api) => api.control({ paused: true }),
++    see: (s) => {
++      const e = s.model.evaluation;
++      if (!e) return ['No evaluation numbers are stored with this model.', 'Run  npm run evaluate  to create them.'];
++      return [
++        `${e.caught} of ${e.breachRuns} real breaches had an AI warning first (${pct(e.detectionRate)}).`,
++        `Median warning: ${e.medianLeadAi} steps before the breach, against ${e.medianLeadRule} for the plain WARNING level.`,
++        `Warnings in runs that never breached: ${pct(e.falseAlarmRate)}.`,
++      ];
++    },
++    say: (s) => {
++      const n = s.model.evaluation?.incidents;
++      return `We tested on ${n ?? 'hundreds of'} fresh simulated incidents that the network never saw in training. To be honest: this is the same simulator, not a real plant, so we claim nothing about real equipment. Slow cooling failures give less advantage, fast problems like fire and machines gain the most.`;
++    },
++  },
++  {
++    id: 'alerts', simPaused: true, page: 'alerts', label: 'Alerts', sec: 9,
++    title: 'Everything is logged',
++    enter: (api) => api.control({ paused: true }),
++    see: () => [
++      'RULE alerts (limit crossed) and AI predictions are kept apart.',
++      'Every operator action is logged with its step number.',
++      'Acknowledge buttons keep a human in the loop.',
++    ],
++    say: () =>
++      'Measurements, AI predictions and operator actions each have their own record. The human stays in charge: the AI advises, the operator acts.',
++  },
++  {
++    id: 'close', page: 'overview', label: 'Overview', sec: 14,
++    title: 'See the heat. Predict the risk. Act before failure.',
++    enter: (api) => api.control({ paused: false, speed: 0.5 }),
++    see: () => [
++      'NEXT: real sensor feeds instead of the simulator.',
++      'NEXT: validate on real plant data.',
++      'NEXT: one model per machine, and learn from operator feedback.',
++    ],
++    say: () =>
++      'Thermal Guard: a digital twin that predicts the risk and tells the operator what to do before failure. It is a prototype, not a certified safety system. Thank you. Questions?',
++  },
++];
++
++export const TOTAL_STEPS = TOUR_STEPS.length;
++/** Nominal tour length in seconds (steps that wait for the AI count their minimum plus ~12 s). */
++export const NOMINAL_SECONDS = TOUR_STEPS.reduce((a, s) => a + s.sec + (s.until ? 8 : 0), 0);
+diff --git a/client/src/index.css b/client/src/index.css
+index c748f23..d2c7476 100644
+--- a/client/src/index.css
++++ b/client/src/index.css
+@@ -17,3 +17,6 @@ body {
+ ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 6px; }
+ .recharts-text { fill: #64748B; font-size: 13px; font-family: inherit; }
+ button { font-family: inherit; }
++
++/* guided tour: leave a little air above the element it scrolls to */
++[id^='tour-'] { scroll-margin-top: 12px; }
+diff --git a/client/src/local/actions/outcomeTracker.ts b/client/src/local/actions/outcomeTracker.ts
+index 14d7ce7..8274cfb 100644
+--- a/client/src/local/actions/outcomeTracker.ts
++++ b/client/src/local/actions/outcomeTracker.ts
+@@ -125,7 +125,7 @@ export class OutcomeTracker {
+     if (r.aiWarningStep !== null && r.firstActionStep !== null && r.reactionSteps !== null) {
+       parts.push(
+         r.reactionSteps >= 0
+-          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} steps to react.`
++          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} ${r.reactionSteps === 1 ? 'step' : 'steps'} to react.`
+           : `First action (step ${r.firstActionStep}) came before the forecast warning was confirmed (step ${r.aiWarningStep}).`,
+       );
+     }
+diff --git a/client/src/local/forecasting/forecaster.ts b/client/src/local/forecasting/forecaster.ts
+index 848c10b..3b4c386 100644
+--- a/client/src/local/forecasting/forecaster.ts
++++ b/client/src/local/forecasting/forecaster.ts
+@@ -1,18 +1,103 @@
+ import type { ModelStatus, ZoneForecast, ZoneId } from '@shared/types';
+-import { FORECAST_HORIZON, ZONES } from '@shared/zones';
++import { FEATURE_COUNT, OUTPUT_COUNT, buildFeatures, decodeDelta } from '@shared/features';
++import { forward, netFromModelFile, type Net } from '@shared/neuralNet';
++import { AI_WARN_RISK, FORECAST_HORIZON, FORECAST_POINTS, ZONES } from '@shared/zones';
++import modelFile from '../../../../server/models/thermal-guard-model.json';
+ import { trendEstimate } from './trendFallback';
+ 
+-/** Browser-only deployment: transparent trend estimates, not neural-network predictions. */
++/**
++ * Browser build: runs the SAME trained neural network as the server (weights trained with
++ * TensorFlow.js, stored in server/models/thermal-guard-model.json, bundled into the page).
++ * If the weights cannot be read for any reason, clearly labelled trend estimates take over.
++ */
+ export class Forecaster {
++  private net: Net | null = null;
+   status: ModelStatus = {
+     state: 'missing',
+-    message: 'Browser demo: trend-based estimates (not neural-network AI).',
++    message: 'Model not loaded yet',
+     horizon: FORECAST_HORIZON,
+   };
+-  async load(): Promise<void> { /* No Node filesystem or server required. */ }
++
++  async load(): Promise<void> {
++    try {
++      const net = netFromModelFile(modelFile);
++      if (net.inputDim !== FEATURE_COUNT || net.outputDim !== OUTPUT_COUNT) {
++        throw new Error(`model shape ${net.inputDim}->${net.outputDim} does not match ${FEATURE_COUNT}->${OUTPUT_COUNT}`);
++      }
++      this.net = net;
++      const meta = (modelFile as { meta: { trainedAt: string; trainingSamples: number; epochs: number; evaluation?: ModelStatus['evaluation'] } }).meta;
++      this.status = {
++        state: 'ready',
++        message: 'Neural network loaded (runs inside this browser)',
++        horizon: FORECAST_HORIZON,
++        trainedAt: meta.trainedAt,
++        trainingSamples: meta.trainingSamples,
++        epochs: meta.epochs,
++        evaluation: meta.evaluation,
++      };
++    } catch (err) {
++      this.net = null;
++      this.status = {
++        state: 'error',
++        message: `Model failed to load (${(err as Error).message}). Showing trend estimates instead (not AI).`,
++        horizon: FORECAST_HORIZON,
++      };
++    }
++  }
++
+   predict(histories: Record<ZoneId, number[]>): Record<ZoneId, ZoneForecast> {
+     const out = {} as Record<ZoneId, ZoneForecast>;
+-    ZONES.forEach((z, i) => { out[z.id] = trendEstimate(histories[z.id], i); });
+-    return out;
++    if (!this.net) {
++      ZONES.forEach((z, i) => { out[z.id] = trendEstimate(histories[z.id], i); });
++      return out;
++    }
++    try {
++      const result = forward(this.net, ZONES.map((z, i) => buildFeatures(histories[z.id], i)));
++      ZONES.forEach((z, i) => {
++        const h = histories[z.id];
++        const t = h[h.length - 1];
++        const risk = result[i * OUTPUT_COUNT];
++        const predicted = FORECAST_POINTS.map((s, k) => ({
++          step: s,
++          temp: t + decodeDelta(result[i * OUTPUT_COUNT + 1 + k]),
++        }));
++        out[z.id] = {
++          zoneId: z.id,
++          source: 'neural-network',
++          riskScore: Math.round(risk * 1000) / 1000,
++          warning: risk >= AI_WARN_RISK && t < z.limit,
++          horizon: FORECAST_HORIZON,
++          predicted,
++          projectedBreachInSteps: firstCrossing(t, predicted, z.limit),
++          slope: h.length > 8 ? (t - h[h.length - 9]) / 8 : 0,
++        };
++      });
++      return out;
++    } catch (err) {
++      this.net = null;
++      this.status = {
++        state: 'error',
++        message: `Inference failed (${(err as Error).message}). Showing trend estimates instead (not AI).`,
++        horizon: FORECAST_HORIZON,
++      };
++      ZONES.forEach((z, i) => { out[z.id] = trendEstimate(histories[z.id], i); });
++      return out;
++    }
++  }
++}
++
++/** First step where the estimated trajectory reaches the limit (linear between sample points). */
++function firstCrossing(t0: number, pts: { step: number; temp: number }[], limit: number): number | null {
++  if (t0 >= limit) return null;
++  let prevStep = 0;
++  let prevTemp = t0;
++  for (const p of pts) {
++    if (p.temp >= limit) {
++      const f = (limit - prevTemp) / (p.temp - prevTemp);
++      return Math.max(1, Math.round(prevStep + f * (p.step - prevStep)));
++    }
++    prevStep = p.step;
++    prevTemp = p.temp;
+   }
++  return null;
+ }
+diff --git a/client/src/pages/AnalyticsPage.tsx b/client/src/pages/AnalyticsPage.tsx
+index ce5a61f..530ca2d 100644
+--- a/client/src/pages/AnalyticsPage.tsx
++++ b/client/src/pages/AnalyticsPage.tsx
+@@ -5,6 +5,7 @@ import { Card } from '../components/ui/Card';
+ import { ForecastChart } from '../components/charts/ForecastChart';
+ import { HistoryChart } from '../components/charts/HistoryChart';
+ import { EarlyWarningCard } from '../components/dashboard/EarlyWarningCard';
++import { EvaluationCard } from '../components/dashboard/EvaluationCard';
+ import { OutcomeCard } from '../components/dashboard/OutcomeCard';
+ import { ZoneChips } from '../components/dashboard/ZoneChips';
+ import { riskWord } from '../utils/thermalColors';
+@@ -40,7 +41,9 @@ export function AnalyticsPage({ snapshot, selected, onSelect }: Props) {
+         </Card>
+       </div>
+ 
+-      <EarlyWarningCard entry={snapshot.timeline[0]} />
++      <div id="tour-early-warning"><EarlyWarningCard entry={snapshot.timeline[0]} /></div>
++
++      <div id="tour-evaluation"><EvaluationCard evaluation={m.evaluation} /></div>
+ 
+       <div className="grid grid-cols-2 gap-6">
+         <Card title="AI model" subtitle="The neural network behind the forecast">
+@@ -84,7 +87,7 @@ export function AnalyticsPage({ snapshot, selected, onSelect }: Props) {
+             The forecast is not a measurement. It is trained on simulated data only and is not validated on real plants.
+           </p>
+         </Card>
+-        <OutcomeCard outcome={snapshot.outcome} />
++        <div id="tour-outcome"><OutcomeCard outcome={snapshot.outcome} /></div>
+       </div>
+     </div>
+   );
+diff --git a/client/src/pages/FixPage.tsx b/client/src/pages/FixPage.tsx
+index a2311fe..be9d523 100644
+--- a/client/src/pages/FixPage.tsx
++++ b/client/src/pages/FixPage.tsx
+@@ -33,7 +33,7 @@ export function FixPage({ snapshot, disabled, selected, onScenario, onReset, onA
+       <Narrator snapshot={snapshot} compact />
+ 
+       <div className="grid grid-cols-[1fr_400px] items-start gap-6">
+-        <div className="space-y-6">
++        <div id="tour-fix-list" className="space-y-6">
+           {open.length === 0 && (
+             <Card>
+               <div className="flex items-center gap-4 py-6">
+diff --git a/client/src/pages/TwinPage.tsx b/client/src/pages/TwinPage.tsx
+index 3991539..96161bb 100644
+--- a/client/src/pages/TwinPage.tsx
++++ b/client/src/pages/TwinPage.tsx
+@@ -1,5 +1,5 @@
+ import { Maximize2, Minus, Plus } from 'lucide-react';
+-import { useRef, useState, type MutableRefObject } from 'react';
++import { useRef, type MutableRefObject } from 'react';
+ import type { SimulationSnapshot, ZoneId } from '@shared/types';
+ import { Button } from '../components/ui/Button';
+ import { StatusPill } from '../components/ui/StatusPill';
+@@ -13,14 +13,20 @@ interface Props {
+   selected: ZoneId;
+   onSelect: (id: ZoneId) => void;
+   onPage: (p: PageId) => void;
++  /** false = one model, true = two models side by side. Owned by App so the guided tour can set it. */
++  view: TwinView;
++  onView: (v: TwinView) => void;
+ }
+ 
++export interface TwinView { two: boolean; thermal: boolean }
++
+ const seg = (on: boolean) =>
+   `px-4 py-2 text-[15px] font-semibold transition ${on ? 'bg-accent text-white' : 'text-muted hover:bg-soft hover:text-ink'}`;
+ 
+-export function TwinPage({ snapshot, selected, onSelect, onPage }: Props) {
+-  const [two, setTwo] = useState(false); // false = one model, true = two models side by side
+-  const [thermal, setThermal] = useState(false);
++export function TwinPage({ snapshot, selected, onSelect, onPage, view, onView }: Props) {
++  const { two, thermal } = view;
++  const setTwo = (v: boolean) => onView({ ...view, two: v });
++  const setThermal = (v: boolean) => onView({ ...view, thermal: v });
+   const apiA = useRef<CameraApi | null>(null);
+   const apiB = useRef<CameraApi | null>(null);
+   const both = (fn: (a: CameraApi) => void) => {
+diff --git a/client/tsconfig.json b/client/tsconfig.json
+index a3dd6ab..c2d7f56 100644
+--- a/client/tsconfig.json
++++ b/client/tsconfig.json
+@@ -9,6 +9,7 @@
+     "skipLibCheck": true,
+     "noEmit": true,
+     "isolatedModules": true,
++    "resolveJsonModule": true,
+     "verbatimModuleSyntax": true,
+     "types": ["vite/client"],
+     "paths": { "@shared/*": ["../shared/*"] }
+diff --git a/docs/DEMO_TOUR.md b/docs/DEMO_TOUR.md
+new file mode 100644
+index 0000000..48565a6
+--- /dev/null
++++ b/docs/DEMO_TOUR.md
+@@ -0,0 +1,31 @@
++# Guided demo: step by step (about 3 minutes)
++
++Start: press **Guided demo** in the top bar, or open the app with `?tour=1` (for example `http://localhost:5173/?tour=1`).
++Controls: **Space** pause / resume (the simulation pauses too) · **← →** back / next · **Esc** stop · click the bar on top to jump · the chevron hides the script and keeps only the title.
++The tour resets the simulation at step 1, so it can be run again and again. The simulation has no random numbers, so every run is the same.
++
++| # | Page | Seconds | Big title | What happens on screen |
++|---|---|---|---|---|
++| 1 | Overview | 12 | THERMAL GUARD | Reset. All six zones green. Say: simulated data. |
++| 2 | Overview | 14 | Six zones. One big meter each. | Explain the meters and colours. |
++| 3 | Live Twin | 12 | The factory as a 3D digital twin | Cooling Unit selected, fans spinning. |
++| 4 | Live Twin | 12 | Machines and heat map, side by side | Two models. |
++| 5 | Fix Center | 9 | Now we BREAK the cooling unit | Tour presses COOLING FAILURE, simulation runs at 1x. |
++| 6 | Live Twin | 7+ | Watch the heat build | Heat map, live temperature and risk. Waits for the AI warning. |
++| 7 | Overview | 18 | AI WARNING: before anything breaks | Simulation paused. Limit not crossed, AI risk shown. |
++| 8 | Fix Center | 12 | WHAT TO DO, and what it costs | Simulation paused. Suggested fix, cost, rules not AI. |
++| 9 | Live Twin | 9+ | The operator presses RESTART COOLING | Tour presses the fix, simulation at 2x, zone cools, timeline closes. |
++| 10 | Analytics | 18 | RESULT: the breach was avoided | Early-warning timeline and outcome built from real events. |
++| 11 | Analytics | 22 | How good is the AI? (simulated test) | Held-out numbers from `npm run evaluate`. |
++| 12 | Alerts | 9 | Everything is logged | Alerts, AI items and operator actions are separate records. |
++| 13 | Overview | 14 | See the heat. Predict the risk. Act before failure. | Next steps and the honest limits. |
++
++Steps 6 and 9 wait for a real event (AI warning, zone back to normal), so total time varies by a few seconds.
++
++## Honest talking points
++* All data is simulated. The evaluation is on the same simulator with fresh incidents, so it says nothing about real plants.
++* For slow cooling failures the amber WARNING level and the AI warning come at almost the same time. The AI gains the most on fast problems (machine overheating, fire). The evaluation table on the Analytics page shows this per incident type.
++* Suggestions in the Fix Center are plain rules, not AI. The AI only says WHEN.
++
++## Changing the tour
++Everything is in `client/src/components/tour/tourSteps.ts`: titles, the "what you are looking at" lines (they can show live numbers), the "say this" text, durations, and the actions each step performs.
+diff --git a/package.json b/package.json
+index 66a720a..78a5539 100644
+--- a/package.json
++++ b/package.json
+@@ -18,9 +18,10 @@
+     "build": "npm run build -w client",
+     "predev": "npm run ensure-model -w server",
+     "ensure-model": "npm run ensure-model -w server",
+-    "rehearse:actions": "npm run rehearse:actions -w server"
++    "rehearse:actions": "npm run rehearse:actions -w server",
++    "evaluate": "npm run evaluate -w server"
+   },
+   "devDependencies": {
+     "concurrently": "^9.0.1"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/server/models/thermal-guard-model.json b/server/models/thermal-guard-model.json
+index fa6b5e4..4258332 100644
+--- a/server/models/thermal-guard-model.json
++++ b/server/models/thermal-guard-model.json
+@@ -1 +1 @@
+-{"meta":{"trainedAt":"2026-10-27T07:03:37.303Z","trainingSamples":84953,"epochs":25,"featureVersion":1,"seed":20260},"modelTopology":{"class_name":"Sequential","config":{"name":"sequential_1","layers":[{"class_name":"Dense","config":{"units":48,"activation":"relu","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":1}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense1","trainable":true,"batch_input_shape":[null,22],"dtype":"float32"}},{"class_name":"Dense","config":{"units":24,"activation":"relu","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":2}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense2","trainable":true}},{"class_name":"Dense","config":{"units":7,"activation":"sigmoid","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":3}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense3","trainable":true}}]},"keras_version":"tfjs-layers 4.22.0","backend":"tensor_flow.js"},"weightSpecs":[{"name":"dense_Dense1/kernel","shape":[22,48],"dtype":"float32"},{"name":"dense_Dense1/bias","shape":[48],"dtype":"float32"},{"name":"dense_Dense2/kernel","shape":[48,24],"dtype":"float32"},{"name":"dense_Dense2/bias","shape":[24],"dtype":"float32"},{"name":"dense_Dense3/kernel","shape":[24,7],"dtype":"float32"},{"name":"dense_Dense3/bias","shape":[7],"dtype":"float32"}],"weightsBase64":"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"}
+\ No newline at end of file
++{"meta":{"trainedAt":"2026-10-27T07:03:37.303Z","trainingSamples":84953,"epochs":25,"featureVersion":1,"seed":20260,"evaluation":{"basis":"300 fresh simulated incidents (seed 90210, not used in training), each replayed zone by zone like the live dashboard","incidents":300,"breachRuns":166,"safeRuns":1634,"caught":165,"detectionRate":0.994,"falseAlarmRate":0.02,"medianLeadAi":26,"medianLeadRule":9,"earlierThanRuleRate":0.921,"byScenario":[{"scenario":"fire","breaches":84,"caught":84,"medianLeadAi":18,"medianLeadRule":7},{"scenario":"machine-overheating","breaches":63,"caught":63,"medianLeadAi":31,"medianLeadRule":12},{"scenario":"cooling-failure","breaches":19,"caught":18,"medianLeadAi":29,"medianLeadRule":35}]}},"modelTopology":{"class_name":"Sequential","config":{"name":"sequential_1","layers":[{"class_name":"Dense","config":{"units":48,"activation":"relu","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":1}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense1","trainable":true,"batch_input_shape":[null,22],"dtype":"float32"}},{"class_name":"Dense","config":{"units":24,"activation":"relu","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":2}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense2","trainable":true}},{"class_name":"Dense","config":{"units":7,"activation":"sigmoid","use_bias":true,"kernel_initializer":{"class_name":"VarianceScaling","config":{"scale":1,"mode":"fan_avg","distribution":"uniform","seed":3}},"bias_initializer":{"class_name":"Zeros","config":{}},"kernel_regularizer":null,"bias_regularizer":null,"activity_regularizer":null,"kernel_constraint":null,"bias_constraint":null,"name":"dense_Dense3","trainable":true}}]},"keras_version":"tfjs-layers 4.22.0","backend":"tensor_flow.js"},"weightSpecs":[{"name":"dense_Dense1/kernel","shape":[22,48],"dtype":"float32"},{"name":"dense_Dense1/bias","shape":[48],"dtype":"float32"},{"name":"dense_Dense2/kernel","shape":[48,24],"dtype":"float32"},{"name":"dense_Dense2/bias","shape":[24],"dtype":"float32"},{"name":"dense_Dense3/kernel","shape":[24,7],"dtype":"float32"},{"name":"dense_Dense3/bias","shape":[7],"dtype":"float32"}],"weightsBase64":"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"}
+\ No newline at end of file
+diff --git a/server/package.json b/server/package.json
+index 0f62de2..916df98 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -10,7 +10,8 @@
+     "rehearse": "tsx src/scripts/rehearse.ts",
+     "typecheck": "tsc --noEmit",
+     "ensure-model": "tsx src/forecasting/ensureModel.ts",
+-    "rehearse:actions": "tsx src/scripts/rehearseActions.ts"
++    "rehearse:actions": "tsx src/scripts/rehearseActions.ts",
++    "evaluate": "tsx src/forecasting/evaluate.ts"
+   },
+   "dependencies": {
+     "@tensorflow/tfjs": "^4.22.0",
+@@ -25,4 +26,4 @@
+     "tsx": "^4.19.1",
+     "typescript": "^5.6.3"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/server/src/actions/outcomeTracker.ts b/server/src/actions/outcomeTracker.ts
+index ee325ba..cfb1131 100644
+--- a/server/src/actions/outcomeTracker.ts
++++ b/server/src/actions/outcomeTracker.ts
+@@ -125,7 +125,7 @@ export class OutcomeTracker {
+     if (r.aiWarningStep !== null && r.firstActionStep !== null && r.reactionSteps !== null) {
+       parts.push(
+         r.reactionSteps >= 0
+-          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} steps to react.`
++          ? `Warning at step ${r.aiWarningStep}, first action at step ${r.firstActionStep}: ${r.reactionSteps} ${r.reactionSteps === 1 ? 'step' : 'steps'} to react.`
+           : `First action (step ${r.firstActionStep}) came before the forecast warning was confirmed (step ${r.aiWarningStep}).`,
+       );
+     }
+diff --git a/server/src/forecasting/dataset.ts b/server/src/forecasting/dataset.ts
+index aa124bb..83072a1 100644
+--- a/server/src/forecasting/dataset.ts
++++ b/server/src/forecasting/dataset.ts
+@@ -30,42 +30,60 @@ interface Options {
+ 
+ const PAD = 40; // steady-state steps placed before each episode so history is always available
+ 
++
++export interface Episode {
++  kind: ScenarioId;
++  /** Peak temperature of every zone, step by step (PAD settled steps first). */
++  series: number[][];
++  /** Index in `series` where the incident started (null for the normal-day runs). */
++  onset: number | null;
++}
++
++/**
++ * Runs ONE randomised incident on the thermal simulation and records every zone's peak temperature.
++ * The order of random draws is fixed: do not reorder (it would change the training data).
++ */
++export function simulateEpisode(rand: () => number, sim: ThermalSimulation, stepsPerEpisode = 300): Episode {
++  const between = (a: number, b: number) => a + (b - a) * rand();
++  sim.reset();
++  const base = sim.getBaselinePeaks();
++  const series: number[][] = ZONES.map((_, z) => Array(PAD).fill(base[z]));
++
++  const r = rand();
++  const kind: ScenarioId =
++    r < 0.12 ? 'normal' : r < 0.42 ? 'cooling-failure' : r < 0.72 ? 'machine-overheating' : 'fire';
++  const onset = Math.floor(between(15, 70));
++  const restoreAt = rand() < 0.6 ? onset + Math.floor(between(25, 160)) : Infinity;
++  const fireZone: ZoneId = ZONE_IDS[Math.floor(rand() * ZONE_IDS.length)];
++  const severity =
++    kind === 'cooling-failure' ? between(0.0, 0.55)
++      : kind === 'machine-overheating' ? between(1.5, 3.4)
++        : between(0.35, 1.2);
++  const machine = rand() < 0.5 ? 'machine-a' : 'machine-b';
++
++  for (let s = 0; s < stepsPerEpisode; s++) {
++    if (s === onset && kind !== 'normal') sim.setScenario(kind, { zoneId: fireZone, severity, machine });
++    if (s === restoreAt) sim.setScenario('normal');
++    sim.tick();
++    const stats = sim.getZoneStats();
++    for (let z = 0; z < ZONES.length; z++) series[z].push(stats[z].peak);
++  }
++  return { kind, series, onset: kind === 'normal' ? null : PAD + onset };
++}
++
+ /**
+  * Generates training sequences by running the SAME thermal simulation with randomised incidents
+  * (different scenario types, zones, severities, start times and recovery times).
+  */
+ export function generateDataset({ episodes, seed, stepsPerEpisode = 300 }: Options): Dataset {
+   const rand = mulberry32(seed);
+-  const between = (a: number, b: number) => a + (b - a) * rand();
+   const sim = new ThermalSimulation();
+   const x: number[][] = [];
+   const y: number[][] = [];
+   let positives = 0;
+ 
+   for (let ep = 0; ep < episodes; ep++) {
+-    sim.reset();
+-    const base = sim.getBaselinePeaks();
+-    const series: number[][] = ZONES.map((_, z) => Array(PAD).fill(base[z]));
+-
+-    const r = rand();
+-    const kind: ScenarioId =
+-      r < 0.12 ? 'normal' : r < 0.42 ? 'cooling-failure' : r < 0.72 ? 'machine-overheating' : 'fire';
+-    const onset = Math.floor(between(15, 70));
+-    const restoreAt = rand() < 0.6 ? onset + Math.floor(between(25, 160)) : Infinity;
+-    const fireZone: ZoneId = ZONE_IDS[Math.floor(rand() * ZONE_IDS.length)];
+-    const severity =
+-      kind === 'cooling-failure' ? between(0.0, 0.55)
+-        : kind === 'machine-overheating' ? between(1.5, 3.4)
+-          : between(0.35, 1.2);
+-    const machine = rand() < 0.5 ? 'machine-a' : 'machine-b';
+-
+-    for (let s = 0; s < stepsPerEpisode; s++) {
+-      if (s === onset && kind !== 'normal') sim.setScenario(kind, { zoneId: fireZone, severity, machine });
+-      if (s === restoreAt) sim.setScenario('normal');
+-      sim.tick();
+-      const stats = sim.getZoneStats();
+-      for (let z = 0; z < ZONES.length; z++) series[z].push(stats[z].peak);
+-    }
++    const { series } = simulateEpisode(rand, sim, stepsPerEpisode);
+ 
+     // Turn the recorded series into (features -> future) examples.
+     const total = series[0].length;
+diff --git a/server/src/forecasting/evaluate.ts b/server/src/forecasting/evaluate.ts
+new file mode 100644
+index 0000000..3e9383a
+--- /dev/null
++++ b/server/src/forecasting/evaluate.ts
+@@ -0,0 +1,156 @@
++// Held-out check of the saved model on FRESH simulated incidents.
++//   npm run evaluate
++//
++// The incidents come from a different random seed than training, so the network has never seen
++// them. Each zone of each incident is replayed step by step exactly like the live dashboard:
++// an AI warning is "confirmed" after AI_CONFIRM_STEPS steps in a row at risk >= AI_WARN_RISK
++// while the zone is still below its limit. We compare it with the ordinary WARNING level
++// (limit - margin), which is what a plain threshold alarm would give.
++//
++// This describes the simulator only. It says nothing about real plants.
++import fs from 'node:fs';
++import type { ModelEvaluation } from '../../../shared/types';
++import { FEATURE_COUNT, OUTPUT_COUNT, buildFeatures } from '../../../shared/features';
++import { forward, netFromModelFile } from '../../../shared/neuralNet';
++import { AI_CONFIRM_STEPS, AI_WARN_RISK, ZONES } from '../../../shared/zones';
++import { ThermalSimulation } from '../simulation/thermalSimulation';
++import { mulberry32, simulateEpisode } from './dataset';
++import { MODEL_FILE } from './modelIO';
++
++export const EVAL_SEED = 90210; // training uses 20260: different incidents
++export const EVAL_EPISODES = 300;
++
++const median = (a: number[]): number | null => {
++  if (!a.length) return null;
++  const s = [...a].sort((x, y) => x - y);
++  const m = Math.floor(s.length / 2);
++  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
++};
++
++export function evaluateModel(raw: unknown, episodes = EVAL_EPISODES, seed = EVAL_SEED): ModelEvaluation {
++  const net = netFromModelFile(raw);
++  if (net.inputDim !== FEATURE_COUNT || net.outputDim !== OUTPUT_COUNT) throw new Error('model shape mismatch; retrain');
++  const rand = mulberry32(seed);
++  const sim = new ThermalSimulation();
++
++  let breachRuns = 0, caught = 0, safeRuns = 0, safeWithWarning = 0, earlier = 0;
++  const leadAi: number[] = [];
++  const leadRule: number[] = [];
++  const by = new Map<string, { breaches: number; caught: number; ai: number[]; rule: number[] }>();
++
++  for (let ep = 0; ep < episodes; ep++) {
++    const { kind, series } = simulateEpisode(rand, sim);
++    const total = series[0].length;
++    // one batch per incident: every zone, every step
++    const rows: number[][] = [];
++    for (let z = 0; z < ZONES.length; z++) {
++      for (let t = 0; t < total; t++) rows.push(buildFeatures(series[z].slice(Math.max(0, t - 30), t + 1), z));
++    }
++    const out = forward(net, rows);
++
++    for (let z = 0; z < ZONES.length; z++) {
++      const zone = ZONES[z];
++      const s = series[z];
++      let breach = -1, ruleWarn = -1, aiWarn = -1, streak = 0;
++      for (let t = 0; t < total; t++) {
++        if (breach < 0 && s[t] >= zone.limit) breach = t;
++        if (ruleWarn < 0 && s[t] >= zone.limit - zone.warningMargin) ruleWarn = t;
++        if (breach >= 0 && t >= breach) break; // after the breach only the rule alarm matters
++        const risk = out[(z * total + t) * OUTPUT_COUNT];
++        if (risk >= AI_WARN_RISK && s[t] < zone.limit) streak++; else streak = 0;
++        if (aiWarn < 0 && streak >= AI_CONFIRM_STEPS) aiWarn = t;
++      }
++      // the confirmed warning must have come BEFORE the breach step
++      if (breach >= 0 && aiWarn >= breach) aiWarn = -1;
++
++      if (breach < 0) {
++        safeRuns++;
++        if (aiWarn >= 0) safeWithWarning++;
++        continue;
++      }
++      breachRuns++;
++      const g = by.get(kind) ?? { breaches: 0, caught: 0, ai: [], rule: [] };
++      g.breaches++;
++      if (aiWarn >= 0) {
++        caught++; g.caught++;
++        const a = breach - aiWarn;
++        const r = ruleWarn >= 0 && ruleWarn <= breach ? breach - ruleWarn : 0;
++        leadAi.push(a); leadRule.push(r); g.ai.push(a); g.rule.push(r);
++        if (a > r) earlier++;
++      }
++      by.set(kind, g);
++    }
++  }
++
++  const round1 = (v: number | null) => (v === null ? null : Math.round(v * 10) / 10);
++  return {
++    basis: `${episodes} fresh simulated incidents (seed ${seed}, not used in training), each replayed zone by zone like the live dashboard`,
++    incidents: episodes,
++    breachRuns,
++    safeRuns,
++    caught,
++    detectionRate: breachRuns ? Math.round((caught / breachRuns) * 1000) / 1000 : 0,
++    falseAlarmRate: safeRuns ? Math.round((safeWithWarning / safeRuns) * 1000) / 1000 : 0,
++    medianLeadAi: round1(median(leadAi)),
++    medianLeadRule: round1(median(leadRule)),
++    earlierThanRuleRate: caught ? Math.round((earlier / caught) * 1000) / 1000 : null,
++    byScenario: [...by.entries()].map(([scenario, g]) => ({
++      scenario, breaches: g.breaches, caught: g.caught,
++      medianLeadAi: round1(median(g.ai)), medianLeadRule: round1(median(g.rule)),
++    })),
++  };
++}
++
++/** Evaluates the saved model file and stores the result inside it (meta.evaluation). */
++export function attachEvaluation(file = MODEL_FILE): ModelEvaluation {
++  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
++  const evaluation = evaluateModel(raw);
++  raw.meta.evaluation = evaluation;
++  fs.writeFileSync(file, JSON.stringify(raw));
++  return evaluation;
++}
++
++/** Makes sure the plain-JS forward pass used in the browser matches TensorFlow.js. */
++async function parityCheck(file = MODEL_FILE): Promise<number> {
++  const tf = await import('@tensorflow/tfjs');
++  await tf.setBackend('cpu');
++  await tf.ready();
++  const { loadModel } = await import('./modelIO');
++  const { model } = await loadModel(tf, file);
++  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
++  const net = netFromModelFile(raw);
++  const rand = mulberry32(7);
++  const rows = Array.from({ length: 200 }, (_, i) => {
++    const h = Array.from({ length: 31 }, (_, k) => 28 + 25 * rand() * (k / 30) + rand());
++    return buildFeatures(h, i % ZONES.length);
++  });
++  const a = forward(net, rows);
++  const b = (model.predict(tf.tensor2d(rows, [rows.length, FEATURE_COUNT])) as import('@tensorflow/tfjs').Tensor).dataSync();
++  let max = 0;
++  for (let i = 0; i < a.length; i++) max = Math.max(max, Math.abs(a[i] - b[i]));
++  return max;
++}
++
++const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
++
++async function main() {
++  const diff = await parityCheck();
++  console.log(`Browser forward pass vs TensorFlow.js: max difference ${diff.toExponential(2)} ${diff < 1e-4 ? '(match)' : '(MISMATCH!)'}`);
++  if (diff >= 1e-4) process.exit(1);
++  const e = attachEvaluation();
++  console.log(`\n${e.basis}`);
++  console.log(`  Breaches in the test: ${e.breachRuns}   caught early by the AI: ${e.caught} (${pct(e.detectionRate)})`);
++  console.log(`  Runs that never breached: ${e.safeRuns}   AI warned anyway: ${pct(e.falseAlarmRate)}`);
++  console.log(`  Median lead before breach: AI ${e.medianLeadAi} steps vs plain WARNING level ${e.medianLeadRule} steps`);
++  console.log(`  AI warned earlier than the WARNING level in ${e.earlierThanRuleRate === null ? '-' : pct(e.earlierThanRuleRate)} of caught breaches`);
++  for (const s of e.byScenario) {
++    console.log(`    ${s.scenario.padEnd(20)} breaches ${String(s.breaches).padStart(3)}  caught ${String(s.caught).padStart(3)}  lead AI ${s.medianLeadAi} vs rule ${s.medianLeadRule}`);
++  }
++  console.log(`\nSaved into ${MODEL_FILE}`);
++  console.log('Simulated data only. This is not a claim about real plants.');
++}
++
++// run only when started directly (`tsx evaluate.ts`), not when imported by train.ts
++if (process.argv[1] && /evaluate\.ts$/.test(process.argv[1])) {
++  main().catch((e) => { console.error(e); process.exit(1); });
++}
+diff --git a/server/src/forecasting/forecaster.ts b/server/src/forecasting/forecaster.ts
+index 098676a..b60f46f 100644
+--- a/server/src/forecasting/forecaster.ts
++++ b/server/src/forecasting/forecaster.ts
+@@ -50,6 +50,7 @@ export class Forecaster {
+         trainedAt: meta.trainedAt,
+         trainingSamples: meta.trainingSamples,
+         epochs: meta.epochs,
++        evaluation: meta.evaluation,
+       };
+     } catch (err) {
+       this.model = null;
+diff --git a/server/src/forecasting/modelIO.ts b/server/src/forecasting/modelIO.ts
+index 0a86f0e..18c9e2f 100644
+--- a/server/src/forecasting/modelIO.ts
++++ b/server/src/forecasting/modelIO.ts
+@@ -1,6 +1,7 @@
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
++import type { ModelEvaluation } from '../../../shared/types';
+ 
+ // The model is stored as ONE json file (topology + weights as base64), so it can be saved and
+ // loaded with the plain-JavaScript TensorFlow.js build. No native add-ons are needed.
+@@ -15,6 +16,7 @@ export interface ModelMeta {
+   epochs: number;
+   featureVersion: number;
+   seed: number;
++  evaluation?: ModelEvaluation;
+ }
+ 
+ /* eslint-disable @typescript-eslint/no-explicit-any */
+diff --git a/server/src/forecasting/train.ts b/server/src/forecasting/train.ts
+index c73375b..985ae8e 100644
+--- a/server/src/forecasting/train.ts
++++ b/server/src/forecasting/train.ts
+@@ -6,6 +6,7 @@ import * as tf from '@tensorflow/tfjs';
+ import { FEATURE_COUNT, FEATURE_VERSION, OUTPUT_COUNT } from '../../../shared/features';
+ import { AI_WARN_RISK } from '../../../shared/zones';
+ import { generateDataset, mulberry32 } from './dataset';
++import { attachEvaluation } from './evaluate';
+ import { MODEL_FILE, saveModel } from './modelIO';
+ 
+ const SEED = 20260;
+@@ -106,6 +107,8 @@ async function main() {
+     seed: SEED,
+   });
+   console.log(`\nSaved model to ${MODEL_FILE}`);
++  const ev = attachEvaluation();
++  console.log(`Fresh-incident check: caught ${ev.caught}/${ev.breachRuns} breaches early, median lead ${ev.medianLeadAi} steps (plain WARNING level: ${ev.medianLeadRule}).`);
+   const last = hist.history.val_loss?.[hist.history.val_loss.length - 1];
+   console.log(`Final validation loss: ${typeof last === 'number' ? last.toFixed(5) : last}`);
+ }
+diff --git a/shared/neuralNet.ts b/shared/neuralNet.ts
+new file mode 100644
+index 0000000..ca52aab
+--- /dev/null
++++ b/shared/neuralNet.ts
+@@ -0,0 +1,77 @@
++// Tiny forward-pass for the trained Thermal Guard network (Dense layers only).
++//
++// The model is TRAINED with TensorFlow.js (server/src/forecasting/train.ts) and saved as one
++// JSON file. This file reads those same trained weights and runs the same maths (matrix
++// multiply + bias + relu/sigmoid) in plain JavaScript, so the browser build can run the real
++// neural network without downloading the 1+ MB TensorFlow.js library.
++// `npm run evaluate` checks that the output matches TensorFlow.js.
++
++export interface DenseLayer {
++  w: Float32Array; // inDim x outDim, row-major (same layout as TensorFlow.js kernels)
++  b: Float32Array;
++  inDim: number;
++  outDim: number;
++  act: 'relu' | 'sigmoid' | 'linear';
++}
++
++export interface Net {
++  layers: DenseLayer[];
++  inputDim: number;
++  outputDim: number;
++}
++
++/* eslint-disable @typescript-eslint/no-explicit-any */
++/** `raw` is the parsed content of server/models/thermal-guard-model.json. */
++export function netFromModelFile(raw: any): Net {
++  const bin = atob(raw.weightsBase64 as string);
++  const bytes = new Uint8Array(bin.length);
++  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
++  const floats = new Float32Array(bytes.buffer);
++
++  const specs: { name: string; shape: number[] }[] = raw.weightSpecs;
++  let offset = 0;
++  const tensors = specs.map((s) => {
++    const n = s.shape.reduce((a, b) => a * b, 1);
++    const data = floats.subarray(offset, offset + n);
++    offset += n;
++    return { name: s.name, shape: s.shape, data };
++  });
++  if (offset !== floats.length) throw new Error('weight file size does not match its description');
++
++  const dense = (raw.modelTopology.config.layers as any[]).filter((l) => l.class_name === 'Dense');
++  if (dense.length * 2 !== tensors.length) throw new Error('unexpected model layout');
++
++  const layers: DenseLayer[] = dense.map((l, i) => {
++    const k = tensors[2 * i];
++    const b = tensors[2 * i + 1];
++    const act = l.config.activation as string;
++    if (act !== 'relu' && act !== 'sigmoid' && act !== 'linear') throw new Error(`unsupported activation ${act}`);
++    return { w: k.data, b: b.data, inDim: k.shape[0], outDim: k.shape[1], act };
++  });
++  return { layers, inputDim: layers[0].inDim, outputDim: layers[layers.length - 1].outDim };
++}
++
++/** Runs a batch of rows through the network. Returns rows x outputDim values, row after row. */
++export function forward(net: Net, rows: number[][]): Float32Array {
++  const out = new Float32Array(rows.length * net.outputDim);
++  for (let r = 0; r < rows.length; r++) {
++    let cur: ArrayLike<number> = rows[r];
++    for (const L of net.layers) {
++      const next = new Float32Array(L.outDim);
++      for (let j = 0; j < L.outDim; j++) next[j] = L.b[j];
++      for (let i = 0; i < L.inDim; i++) {
++        const v = cur[i];
++        if (v === 0) continue;
++        const base = i * L.outDim;
++        for (let j = 0; j < L.outDim; j++) next[j] += v * L.w[base + j];
++      }
++      for (let j = 0; j < L.outDim; j++) {
++        const z = next[j];
++        next[j] = L.act === 'relu' ? Math.max(0, z) : L.act === 'sigmoid' ? 1 / (1 + Math.exp(-z)) : z;
++      }
++      cur = next;
++    }
++    out.set(cur as Float32Array, r * net.outputDim);
++  }
++  return out;
++}
+diff --git a/shared/types.ts b/shared/types.ts
+index 52d36fc..59c78e3 100644
+--- a/shared/types.ts
++++ b/shared/types.ts
+@@ -57,6 +57,30 @@ export interface ZoneForecast {
+   slope: number;
+ }
+ 
++/** Held-out check on FRESH simulated incidents (never used for training). Not real-plant data. */
++export interface ModelEvaluation {
++  /** Plain-words description of what was tested. */
++  basis: string;
++  incidents: number;
++  /** Zone runs where the temperature limit really was crossed. */
++  breachRuns: number;
++  /** Zone runs where the limit was never crossed. */
++  safeRuns: number;
++  /** Breaches the AI warned about before they happened. */
++  caught: number;
++  /** caught / breachRuns, 0..1. */
++  detectionRate: number;
++  /** Safe runs in which the AI still raised a warning, 0..1. */
++  falseAlarmRate: number;
++  /** Median steps between the AI warning and the breach (caught breaches only). */
++  medianLeadAi: number | null;
++  /** Median steps between the ordinary WARNING level being reached and the breach (same breaches). */
++  medianLeadRule: number | null;
++  /** Share of caught breaches where the AI warned earlier than the WARNING level did. */
++  earlierThanRuleRate: number | null;
++  byScenario: { scenario: string; breaches: number; caught: number; medianLeadAi: number | null; medianLeadRule: number | null }[];
++}
++
+ export interface ModelStatus {
+   state: 'ready' | 'missing' | 'error';
+   message: string;
+@@ -64,6 +88,7 @@ export interface ModelStatus {
+   trainedAt?: string;
+   trainingSamples?: number;
+   epochs?: number;
++  evaluation?: ModelEvaluation;
+ }
+ 
+ export interface Alert {

@@ -1,5 +1,5 @@
 import { Maximize2, Minus, Plus } from 'lucide-react';
-import { useRef, useState, type MutableRefObject } from 'react';
+import { useRef, type MutableRefObject } from 'react';
 import type { SimulationSnapshot, ZoneId } from '@shared/types';
 import { Button } from '../components/ui/Button';
 import { StatusPill } from '../components/ui/StatusPill';
@@ -13,14 +13,20 @@ interface Props {
   selected: ZoneId;
   onSelect: (id: ZoneId) => void;
   onPage: (p: PageId) => void;
+  /** false = one model, true = two models side by side. Owned by App so the guided tour can set it. */
+  view: TwinView;
+  onView: (v: TwinView) => void;
 }
+
+export interface TwinView { two: boolean; thermal: boolean }
 
 const seg = (on: boolean) =>
   `px-4 py-2 text-[15px] font-semibold transition ${on ? 'bg-accent text-white' : 'text-muted hover:bg-soft hover:text-ink'}`;
 
-export function TwinPage({ snapshot, selected, onSelect, onPage }: Props) {
-  const [two, setTwo] = useState(false); // false = one model, true = two models side by side
-  const [thermal, setThermal] = useState(false);
+export function TwinPage({ snapshot, selected, onSelect, onPage, view, onView }: Props) {
+  const { two, thermal } = view;
+  const setTwo = (v: boolean) => onView({ ...view, two: v });
+  const setThermal = (v: boolean) => onView({ ...view, thermal: v });
   const apiA = useRef<CameraApi | null>(null);
   const apiB = useRef<CameraApi | null>(null);
   const both = (fn: (a: CameraApi) => void) => {

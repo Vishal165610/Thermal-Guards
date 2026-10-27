@@ -33,7 +33,7 @@ export function FixPage({ snapshot, disabled, selected, onScenario, onReset, onA
       <Narrator snapshot={snapshot} compact />
 
       <div className="grid grid-cols-[1fr_400px] items-start gap-6">
-        <div className="space-y-6">
+        <div id="tour-fix-list" className="space-y-6">
           {open.length === 0 && (
             <Card>
               <div className="flex items-center gap-4 py-6">

@@ -50,6 +50,7 @@ export class Forecaster {
         trainedAt: meta.trainedAt,
         trainingSamples: meta.trainingSamples,
         epochs: meta.epochs,
+        evaluation: meta.evaluation,
       };
     } catch (err) {
       this.model = null;

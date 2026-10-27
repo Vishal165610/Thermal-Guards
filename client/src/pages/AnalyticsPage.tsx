@@ -5,6 +5,7 @@ import { Card } from '../components/ui/Card';
 import { ForecastChart } from '../components/charts/ForecastChart';
 import { HistoryChart } from '../components/charts/HistoryChart';
 import { EarlyWarningCard } from '../components/dashboard/EarlyWarningCard';
+import { EvaluationCard } from '../components/dashboard/EvaluationCard';
 import { OutcomeCard } from '../components/dashboard/OutcomeCard';
 import { ZoneChips } from '../components/dashboard/ZoneChips';
 import { riskWord } from '../utils/thermalColors';
@@ -40,7 +41,9 @@ export function AnalyticsPage({ snapshot, selected, onSelect }: Props) {
         </Card>
       </div>
 
-      <EarlyWarningCard entry={snapshot.timeline[0]} />
+      <div id="tour-early-warning"><EarlyWarningCard entry={snapshot.timeline[0]} /></div>
+
+      <div id="tour-evaluation"><EvaluationCard evaluation={m.evaluation} /></div>
 
       <div className="grid grid-cols-2 gap-6">
         <Card title="AI model" subtitle="The neural network behind the forecast">
@@ -84,7 +87,7 @@ export function AnalyticsPage({ snapshot, selected, onSelect }: Props) {
             The forecast is not a measurement. It is trained on simulated data only and is not validated on real plants.
           </p>
         </Card>
-        <OutcomeCard outcome={snapshot.outcome} />
+        <div id="tour-outcome"><OutcomeCard outcome={snapshot.outcome} /></div>
       </div>
     </div>
   );
